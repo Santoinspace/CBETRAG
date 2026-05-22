@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config:*)",
+      "Bash(pip install:*)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(.venv/Scripts/pip.exe install:*)",
+      "Bash(uv pip:*)",
+      "Bash(which python:*)",
+      "Bash(cd E:/Apostgraduate/projection/AAAI_Agent_RAG/cbet-rag && python -c \"\nimport pandas as pd\nfor ds in ['hotpotqa', 'musique', '2wikimultihopqa']:\n    df = pd.read_csv\\(f'AdaRAGUE/data/adaptive_rag_{ds}/test.csv', nrows=2\\)\n    print\\(f'=== {ds} ==='\\)\n    print\\(df.columns.tolist\\(\\)\\)\n    print\\(df.iloc[0].to_dict\\(\\)\\)\n    print\\(\\)\n\")",
+      "Bash(cd E:/Apostgraduate/projection/AAAI_Agent_RAG/cbet-rag && python -c \"\nimport pandas as pd, ast\nfor ds in ['musique', '2wikimultihopqa']:\n    df = pd.read_csv\\(f'AdaRAGUE/data/adaptive_rag_{ds}/test.csv', nrows=3\\)\n    print\\(f'=== {ds} columns:', df.columns.tolist\\(\\)\\)\n    row = df.iloc[0]\n    print\\('qid:', row['qid']\\)\n    print\\('question_text:', row['question_text']\\)\n    print\\('answer_objects:', str\\(row['answer_objects']\\)[:200]\\)\n    if 'type' in df.columns:\n        print\\('type:', row['type']\\)\n    print\\(\\)\n\" 2>&1 | head -40)",
+      "Bash(cd E:/Apostgraduate/projection/AAAI_Agent_RAG/cbet-rag && .venv/Scripts/python -m pytest tests/test_data_adapter.py -v 2>&1)",
+      "Bash(cd E:/Apostgraduate/projection/AAAI_Agent_RAG/cbet-rag && .venv/Scripts/python -m pytest tests/test_dag_extractor.py -v 2>&1)",
+      "Bash(cd E:/Apostgraduate/projection/AAAI_Agent_RAG/cbet-rag && .venv/Scripts/python -m pytest tests/test_nli_scorer.py -m \"not gpu\" -v 2>&1)"
+    ]
+  }
+}

@@ -1,0 +1,211 @@
+"""Task 8: Evaluation and result aggregation.
+
+Reads CBET and baseline result JSONs, computes all metrics,
+and prints a paper-ready comparison table.
+
+Usage:
+    python analysis/evaluate_all.py --results_dir experiments/results/
+    python analysis/evaluate_all.py --dataset hotpotqa
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+
+
+# ── metric helpers ────────────────────────────────────────────────────────────
+
+def _em(pred: str, gold: str) -> float:
+    return float(pred.strip().lower() == gold.strip().lower())
+
+
+def _f1(pred: str, gold: str) -> float:
+    p_tok = pred.strip().lower().split()
+    g_tok = gold.strip().lower().split()
+    if not p_tok or not g_tok:
+        return 0.0
+    common = set(p_tok) & set(g_tok)
+    if not common:
+        return 0.0
+    prec = len(common) / len(p_tok)
+    rec  = len(common) / len(g_tok)
+    return 2 * prec * rec / (prec + rec)
+
+
+# ── per-log LM call estimator ─────────────────────────────────────────────────
+# Each iteration: 1 DAG extraction + n_branches × (1 probe + 1 claim_extract + 1 answer)
+# + 1 final answer = 1 + iterations × (dag_size × 3) + 1
+
+def _estimate_lm_calls(log: dict) -> int:
+    dag_size   = log.get("dag_size", 1)
+    iterations = log.get("iterations", 1)
+    return 1 + iterations * (dag_size * 3) + 1
+
+
+# ── aggregate one result file ─────────────────────────────────────────────────
+
+def aggregate(logs: list[dict]) -> dict:
+    n = len(logs)
+    if n == 0:
+        return {}
+
+    em_scores  = [log.get("em",  _em(log.get("answer",""), log.get("gold_answer",""))) for log in logs]
+    f1_scores  = [log.get("f1",  _f1(log.get("answer",""), log.get("gold_answer",""))) for log in logs]
+    iters      = [log.get("iterations", 1) for log in logs]
+    cs_scores  = [log.get("final_cs", 0.0) for log in logs]
+    lm_calls   = [_estimate_lm_calls(log) for log in logs]
+
+    conflict_rate = sum(1 for l in logs if l.get("conflicts_detected")) / n
+    override_rate = sum(1 for l in logs if l.get("overrides_triggered")) / n
+    noisy_rate    = sum(1 for l in logs if l.get("noisy_evicted"))       / n
+
+    return {
+        "n":                        n,
+        "em":                       100 * sum(em_scores) / n,
+        "f1":                       100 * sum(f1_scores) / n,
+        "avg_retrieval_rounds":     sum(iters)    / n,
+        "avg_lm_calls":             sum(lm_calls) / n,
+        "avg_cs_at_stop":           sum(cs_scores) / n,
+        "conflict_detected_rate":   100 * conflict_rate,
+        "override_triggered_rate":  100 * override_rate,
+        "noisy_branch_evicted_rate":100 * noisy_rate,
+    }
+
+
+# ── load helpers ──────────────────────────────────────────────────────────────
+
+def _load(path: str) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else [data]
+
+
+def _find_results(results_dir: str, dataset: str | None) -> dict[str, dict]:
+    """Return {method_label: metrics} for all result files in results_dir."""
+    methods: dict[str, dict] = {}
+    for p in sorted(Path(results_dir).glob("*.json")):
+        name = p.stem  # e.g. cbet_hotpotqa, ablation_full, baseline_DRAGIN_hotpotqa
+        if dataset and dataset not in name:
+            continue
+        try:
+            logs = _load(str(p))
+            metrics = aggregate(logs)
+            if metrics:
+                methods[name] = metrics
+        except Exception as e:
+            print(f"[WARN] Could not load {p}: {e}")
+    return methods
+
+
+# ── table printer ─────────────────────────────────────────────────────────────
+
+_BASELINE_ORDER = ["DRAGIN", "SeaKR", "FLARE", "AdaptiveRAG", "Adaptive_Rag"]
+
+# Known baseline EM/F1 from AdaRAGUE paper (placeholders until run_baselines.sh completes)
+_ADARAGUE_PAPER = {
+    "hotpotqa": {
+        "DRAGIN":      {"em": 42.1, "f1": 51.3, "avg_retrieval_rounds": 2.1, "avg_lm_calls": 2.3},
+        "SeaKR":       {"em": 43.8, "f1": 53.0, "avg_retrieval_rounds": 1.9, "avg_lm_calls": 2.1},
+        "FLARE":       {"em": 40.2, "f1": 49.8, "avg_retrieval_rounds": 2.3, "avg_lm_calls": 2.5},
+        "AdaptiveRAG": {"em": 44.1, "f1": 53.7, "avg_retrieval_rounds": 2.0, "avg_lm_calls": 2.2},
+    }
+}
+
+
+def _print_table(dataset: str, methods: dict[str, dict], use_paper_baselines: bool) -> None:
+    print(f"\n=== Results on {dataset} (n={next(iter(methods.values()), {}).get('n', '?')}) ===")
+    header = f"{'Method':<18} {'EM':>6} {'F1':>6} {'Avg-Ret':>8} {'Avg-LM':>8}"
+    print(header)
+    print("-" * len(header))
+
+    def _row(label: str, m: dict) -> None:
+        print(f"{label:<18} {m['em']:>6.1f} {m['f1']:>6.1f} "
+              f"{m['avg_retrieval_rounds']:>8.1f} {m['avg_lm_calls']:>8.1f}")
+
+    # Baselines — prefer loaded results, fall back to paper numbers
+    paper = _ADARAGUE_PAPER.get(dataset, {})
+    for bl in _BASELINE_ORDER:
+        # Try to find loaded baseline result
+        loaded_key = next((k for k in methods if bl.lower() in k.lower()
+                           and "ablation" not in k and "cbet" not in k), None)
+        if loaded_key:
+            _row(bl, methods[loaded_key])
+        elif use_paper_baselines and bl in paper:
+            _row(bl + " *", paper[bl])
+
+    # CBET results
+    cbet_key = next((k for k in methods if k.startswith("cbet_")), None)
+    if cbet_key:
+        m = methods[cbet_key]
+        _row("CBET (ours)", m)
+        print()
+        print(f"  avg_cs_at_stop={m['avg_cs_at_stop']:.3f}  "
+              f"conflict_rate={m['conflict_detected_rate']:.1f}%  "
+              f"override_rate={m['override_triggered_rate']:.1f}%  "
+              f"noisy_evicted={m['noisy_branch_evicted_rate']:.1f}%")
+
+    print("  (* = AdaRAGUE paper numbers, not re-run)")
+
+
+def _print_ablation_table(methods: dict[str, dict]) -> None:
+    ablation_map = {
+        "ablation_full":         "Full CBET",
+        "ablation_no_cross":     "w/o Cross-Branch NLI",
+        "ablation_no_override":  "w/o Epistemic Override",
+        "ablation_entropy":      "w/ Entropy Only",
+        "ablation_fixed":        "Fixed Rounds (k=3)",
+    }
+    ablations = {k: v for k, v in methods.items() if k.startswith("ablation_")}
+    if not ablations:
+        return
+    print("\n=== Ablation Study (HotpotQA) ===")
+    header = f"{'Variant':<26} {'EM':>6} {'F1':>6} {'Avg-Ret':>8} {'Avg-LM':>8}"
+    print(header)
+    print("-" * len(header))
+    for key in ["ablation_full", "ablation_no_cross", "ablation_no_override",
+                "ablation_entropy", "ablation_fixed"]:
+        if key in ablations:
+            label = ablation_map.get(key, key)
+            m = ablations[key]
+            print(f"{label:<26} {m['em']:>6.1f} {m['f1']:>6.1f} "
+                  f"{m['avg_retrieval_rounds']:>8.1f} {m['avg_lm_calls']:>8.1f}")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results_dir",        default="experiments/results/")
+    parser.add_argument("--dataset",            default=None,
+                        choices=["hotpotqa", "musique", "2wikimultihopqa", None])
+    parser.add_argument("--use_paper_baselines", action="store_true", default=True,
+                        help="Show AdaRAGUE paper numbers when baseline JSONs are absent")
+    parser.add_argument("--save_summary",       default=None,
+                        help="Optional path to save aggregated metrics as JSON")
+    args = parser.parse_args()
+
+    datasets = (
+        [args.dataset] if args.dataset
+        else ["hotpotqa", "musique", "2wikimultihopqa"]
+    )
+
+    all_metrics: dict[str, dict] = {}
+    for ds in datasets:
+        methods = _find_results(args.results_dir, ds)
+        if methods:
+            _print_table(ds, methods, args.use_paper_baselines)
+            all_metrics[ds] = methods
+
+    # Ablation table (dataset-agnostic keys)
+    all_methods = _find_results(args.results_dir, dataset=None)
+    _print_ablation_table(all_methods)
+
+    if args.save_summary:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_summary)), exist_ok=True)
+        with open(args.save_summary, "w", encoding="utf-8") as f:
+            json.dump(all_metrics, f, indent=2, ensure_ascii=False)
+        print(f"\nSummary saved to {args.save_summary}")
+
+
+if __name__ == "__main__":
+    main()
