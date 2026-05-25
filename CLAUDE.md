@@ -808,6 +808,8 @@ def run(args):
 | θ 重标定                  | ✅ 完成   | 2026-05-25 | HotpotQA30 网格搜索；最优 θ=0.50, EarlyStop%=26.7%, F1=65.4；已更新所有 configs/*.yaml                                |
 | string-match floor 移除    | ✅ 完成   | 2026-05-25 | 删除虚假 floor=0.5；纯 NLI CS 均值 0.099, 范围 0.0-0.941；1/10 样本 CS≥0.5                                               |
 | NLI 方向修复 v2            | ⚠️ 阻断   | 2026-05-25 | NLI(claim→answer) 语义正确；但 CS 仍近 0 (0/10≥0.3) — 根因：3B 模型 claim extraction 输出非 JSON 格式，parse 失败       |
+| Claim extraction 修复      | ✅ 完成   | 2026-05-25 | 新 prompt (纯文本) + robust parser (JSON→编号→项目符号→句分割)；Cov=0.99 ✅；CS=0 因 GCS=0（见下）                       |
+| GCS density-based refactor | ✅ 完成   | 2026-05-25 | conflict_ratio > threshold (0.35) 替代 boolean contradiction；新增 CompletenessResult 遥测字段；18+9 tests pass            |
 | ES 状态检查                | ✅ 完成   | 2026-05-25 | ES 未运行；Docker 可用；Wikipedia TSV 未下载 (需 ~14GB 压缩, ~32GB 解压)；可用磁盘 56GB                              |
 | BM25 mini 索引             | ✅ 完成   | 2026-05-25 | 4928 passages, 2.6 MB, <10ms/query；rank-bm25 已安装；src/bm25_retriever.py 就绪                                         |
 | CBET 完整实验              | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
@@ -848,7 +850,10 @@ def run(args):
 - [2026-05-25] Coverage 计算方向修复 → NLI(answer→claim) 替代 NLI(evidence→answer) → 原方向"长段落 entail 短答案"系统性偏低，与 DeBERTa 短句子对设计不符；新方向为"短→短"设计场景，配合 string-match floor=0.5；CS 从 ~0.01 提升到 0.0-0.94 双峰分布
 - [2026-05-25] θ 重标定完成 → 最优 θ=0.50 → HotpotQA30 网格搜索 [0.3-0.8]；θ=0.50 时 EarlyStop%=26.7%, Avg-Ret=2.47, F1=65.4；CS 双峰分布 (0.0/0.5+) 使 θ ∈ [0.12,0.50] 行为相同；选 0.50 作为传统 half-point 且有最大噪声容限；已更新 cbet_hotpotqa/musique/2wiki/7b.yaml
 - [2026-05-25] string-match floor 移除 → 删除强制 floor=0.5 → 该逻辑制造虚假双峰 CS 分布 (26.7% 虚高早停率)；纯 NLI CS 均值 0.099, 范围 0.0-0.941；真实 NLI 覆盖度在 DatasetRetriever 场景下偏低；θ 标定需等真实检索器 (ES) 接入后重做
-- [2026-05-25] NLI Coverage 方向第二次修正 → NLI(claim→answer) 前提蕴含假设 → DeBERTa 设计场景，语义正确；但修复后 CS 仍趋近 0 → 诊断发现根因是 3B 模型 claim extraction 输出非 JSON 格式（编号列表/JSON截断/preamble），_parse_claims 无法正确提取，导致 coverage 计算失败
+- [2026-05-25] NLI Coverage 方向第二次修正 → NLI(claim→answer) 前提蕴含假设 → DeBERTa 设计场景，语义正确；但修复后 CS 仍趋近 0 → 诊断发现根因是 3B 模型 claim extraction 输出非 JSON 格式
+- [2026-05-25] Claim extraction 重写 → 新 prompt (纯文本 3-5 条) + robust parser (4 strategies: JSON recovery→编号列表→项目符号→句分割) + claim filtering；Cov 恢复到 0.99，claims 数量 4-8；parser 对 3B 编号列表输出稳定
+- [2026-05-25] GCS blocker 定位 → Cov 已修复但 CS 仍为 0 → 根因：布尔 GCS 在混合证据场景恒 0
+- [2026-05-25] GCS density-based refactor → conflict_ratio = n_contra / (len(claims_i) × len(claims_j)) > threshold (0.35) → 替代 boolean 检查；新增 CompletenessResult 字段 (avg_conflict_ratio, max_conflict_ratio, contradicting_branch_pairs, valid_branch_pairs)；CBETConfig.gcs_conflict_threshold=0.35；NLIScorer 构造函数接受此参数；18/18 NLI + 9/9 e2e tests pass；GCS 从恒 0 恢复到有意义分布 (mean=0.6)
 - [2026-05-25] Wikipedia 索引策略 → BM25 mini 索引替代 → 峰值磁盘 71GB 超出可用 56GB；数据集内 BM25 (4928 passages, 2.6 MB) 可验证迭代检索机制，不同 query 返回不同排序结果
 
 ---
@@ -861,4 +866,5 @@ def run(args):
 - **风险 4**：DAG 提取质量依赖 Qwen2.5-7B 的 instruction following 能力，4-hop+ 问题可能产生不合理分解。**缓解**：设置 `max_branches=6`，超出时合并。
 - **风险 5**：`compute_gcs` 的两两 NLI 调用量为 O(n²)，分支数 6 时需 15 次调用。**缓解**：DeBERTa batch_size=16，批量推理约 0.3s/batch on 4060，可接受。
 - **风险 6（CS 标定 — 已解决）**：CS 通过 NLI 方向反转修复，纯 NLI CS 均值 0.099, 范围 0.0-0.941。θ=0.50 标定完成 (HotpotQA30)。CS 偏低问题已解决；θ 在 7B 模型下可能需要微调。
-- **风险 7（ES 关键阻塞）**：ES Wikipedia 索引未建立 — 无 ES 容器运行，无 Wikipedia TSV 数据。θ 标定、早停验证、正式实验均依赖真实检索环境。**需要**：① 启动 Docker ES 容器（docker run elasticsearch:8.11.0）；② 下载 psgs_w100.tsv.gz (~14GB, Facebook DPR)；③ 运行 build_wiki_index.py 建索引 (~32GB 解压后, ~4-8h 索引时间)。可用磁盘 56GB，可满足但紧张。
+- **风险 7（ES 关键阻塞）**：ES Wikipedia 索引未建立。
+- **风险 8（GCS 混合证据阻塞 — 已解决）**：GCS 现在使用 density-based threshold（conflict_ratio > 0.35），不再因单对矛盾 claim 归零。遥测字段（avg/max_conflict_ratio, pair counts）已加入 CompletenessResult 和 JSON log。gcs_conflict_threshold=0.35 为 3B+DatasetRetriever 场景校准值。

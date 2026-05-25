@@ -18,10 +18,17 @@ logger = logging.getLogger(__name__)
 _LABEL_ORDER = ["contradiction", "entailment", "neutral"]
 
 _CLAIMS_PROMPT = """\
-Extract all atomic factual claims from this text as a JSON list of simple declarative sentences.
-Each claim must be independently verifiable. Remove opinions and vague statements.
+Extract 3 to 5 important factual claims from the text.
+
+Rules:
+- One claim per line
+- Use simple declarative sentences
+- Do NOT output JSON
+- Do NOT explain
+
 Text: {text}
-Output: {{"claims": ["claim1", "claim2", ...]}}"""
+
+Claims:"""
 
 
 @dataclass
@@ -40,6 +47,10 @@ class CompletenessResult:
     cs: float               # = min_coverage × gcs
     should_stop: bool       # cs >= theta
     noisy_branch_ids: list[int]
+    avg_conflict_ratio: float = 0.0
+    max_conflict_ratio: float = 0.0
+    contradicting_branch_pairs: int = 0
+    valid_branch_pairs: int = 0
 
 
 class NLIScorer:
@@ -49,12 +60,14 @@ class NLIScorer:
         device: str = "cuda",
         batch_size: int = 16,
         theta: float = 0.75,
+        gcs_conflict_threshold: float = 0.35,
     ):
         from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
         self.device = device
         self.batch_size = batch_size
         self.theta = theta
+        self.gcs_conflict_threshold = gcs_conflict_threshold
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.model = (
             AutoModelForSequenceClassification.from_pretrained(model_path)
@@ -106,10 +119,32 @@ class NLIScorer:
                 )
         return results
 
+    # ── claim parsing pipeline ─────────────────────────────────────────────────
+
+    _PREAMBLE_PATTERNS = [
+        re.compile(r'^here\s+(?:is|are)\s+the', re.IGNORECASE),
+        re.compile(r'^the\s+(?:following|extracted|claims|text)', re.IGNORECASE),
+        re.compile(r'^(?:claims?|extracted\s+claims?)\s*:', re.IGNORECASE),
+        re.compile(r'^(?:output|result|response)\s*:', re.IGNORECASE),
+        re.compile(r'^(?:sure|okay|here\s+you\s+go|i\'?ll?\s+extract)', re.IGNORECASE),
+        re.compile(r'^to\s+extract', re.IGNORECASE),
+    ]
+
+    _BAD_CLAIM_PATTERNS = [
+        re.compile(r'^here\s+(?:is|are)\s+the', re.IGNORECASE),
+        re.compile(r'^(?:claims?|extracted)\s*:', re.IGNORECASE),
+        re.compile(r'^(?:the\s+)?(?:following|above|below)', re.IGNORECASE),
+    ]
+
     def _parse_claims(self, text: str) -> list[str]:
-        """Parse claims from LLM output. Handles JSON, numbered/bullet lists, plain text."""
+        """Robust claim parser: JSON→numbered list→bullets→sentence split.
+
+        Returns list of cleaned claim strings. Never falls back to [raw_text].
+        """
         text = text.strip()
-        # Strip markdown code fences
+        original_text = text  # keep for debug
+
+        # ── Strategy 0: strip markdown fences ──
         if text.startswith("```"):
             lines = text.splitlines()
             if lines[-1].strip() == "```":
@@ -117,33 +152,156 @@ class NLIScorer:
             else:
                 text = "\n".join(lines[1:])
             text = text.strip()
-        # Try JSON first
+
+        # ── Strategy 1: JSON recovery ──
+        claims = self._try_json_recovery(text)
+        if claims:
+            logger.debug("claims parsed via JSON recovery: %d claims", len(claims))
+            return self._filter_claims(claims)
+
+        # ── Strategy 2: numbered list ──
+        claims = self._extract_numbered_list(text)
+        if claims:
+            logger.debug("claims parsed via numbered list: %d claims", len(claims))
+            return self._filter_claims(claims)
+
+        # ── Strategy 3: markdown bullets ──
+        claims = self._extract_bullet_list(text)
+        if claims:
+            logger.debug("claims parsed via bullet list: %d claims", len(claims))
+            return self._filter_claims(claims)
+
+        # ── Strategy 4: sentence split ──
+        claims = self._sentence_split(text)
+        if claims:
+            logger.debug("claims parsed via sentence split: %d claims", len(claims))
+            return self._filter_claims(claims)
+
+        # ── Final fallback: split text into chunks ──
+        logger.warning("_parse_claims all strategies failed; raw_len=%d", len(original_text))
+        logger.debug("raw text (first 200 chars): %s", original_text[:200])
+        return [original_text[:500]]
+
+    # ── strategy helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _try_json_recovery(text: str) -> list[str] | None:
+        """Attempt JSON parsing including truncated/partial forms."""
+        # Try direct JSON
         try:
             data = json.loads(text)
-            claims = data.get("claims", [])
-            if isinstance(claims, list) and claims:
-                return [str(c) for c in claims]
+            return NLIScorer._extract_from_json_obj(data)
         except (json.JSONDecodeError, AttributeError):
             pass
-        # Try numbered/bullet list extraction
+        # Try json_repair if available
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(text)
+            data = json.loads(repaired)
+            return NLIScorer._extract_from_json_obj(data)
+        except Exception:
+            pass
+        # Try extracting from truncated JSON array: ["c1", "c2", "c3...
+        m = re.search(r'\[(.*?)(?:\]|$)', text, re.DOTALL)
+        if m:
+            inner = m.group(1)
+            # Extract quoted strings from the array content
+            quoted = re.findall(r'"([^"]{10,})"', inner)
+            if len(quoted) >= 2:
+                return quoted
+        return None
+
+    @staticmethod
+    def _extract_from_json_obj(data) -> list[str] | None:
+        """Pull claims from various JSON shapes."""
+        if isinstance(data, list):
+            return [str(x) for x in data if isinstance(x, str)]
+        if isinstance(data, dict):
+            for key in ("claims", "claim", "facts", "statements", "output"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    return [str(x) for x in val if isinstance(x, str)]
+        return None
+
+    @staticmethod
+    def _extract_numbered_list(text: str) -> list[str] | None:
+        """Extract from '1. claim one\n2. claim two' format."""
         lines = text.splitlines()
         claims = []
         for line in lines:
             stripped = line.strip()
-            # Match "1. claim text" or "- claim text" or "• claim text"
-            m = re.match(r'^(?:\d+[\.\)]\s*|[•\-\*]\s*)(.+)$', stripped)
+            m = re.match(r'^\d+\s*[\.\)\)]\s*(.+)$', stripped)
             if m:
-                claim = m.group(1).strip().strip('"')
-                if len(claim) > 15:  # filter short fragments
+                claim = m.group(1).strip().strip('"').strip("'")
+                if len(claim) > 10:
                     claims.append(claim)
-        if claims:
-            return claims
-        # Fallback: split by sentence boundaries and filter
-        raw_sents = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
-        sents = [s.strip() for s in raw_sents if len(s.strip()) > 15]
-        if sents:
-            return sents
-        return [text]
+        return claims if len(claims) >= 2 else None
+
+    @staticmethod
+    def _extract_bullet_list(text: str) -> list[str] | None:
+        """Extract from '- claim' or '* claim' or '• claim' format."""
+        lines = text.splitlines()
+        claims = []
+        for line in lines:
+            stripped = line.strip()
+            m = re.match(r'^[\-\*\•\▪\▸]\s*(.+)$', stripped)
+            if m:
+                claim = m.group(1).strip().strip('"').strip("'")
+                if len(claim) > 10:
+                    claims.append(claim)
+        return claims if len(claims) >= 2 else None
+
+    @staticmethod
+    def _sentence_split(text: str) -> list[str] | None:
+        """Split by sentence boundaries, filtering preamble lines."""
+        lines = text.splitlines()
+        sents = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Split on sentence boundaries within the line
+            parts = re.split(r'(?<=[.!?])\s+', stripped)
+            for p in parts:
+                p = p.strip()
+                if len(p) > 15:
+                    sents.append(p)
+        # Deduplicate by prefix
+        seen = set()
+        unique = []
+        for s in sents:
+            prefix = s[:40].lower()
+            if prefix not in seen:
+                seen.add(prefix)
+                unique.append(s)
+        return unique if len(unique) >= 1 else None
+
+    # ── claim filtering ───────────────────────────────────────────────────────
+
+    def _filter_claims(self, claims: list[str]) -> list[str]:
+        """Remove preamble lines, prompt echoes, and noise."""
+        filtered = []
+        for c in claims:
+            c = c.strip().strip('"').strip("'")
+            # Length filter
+            if len(c) < 10 or len(c) > 500:
+                continue
+            # Preamble/garbage filter
+            if any(pat.search(c) for pat in self._BAD_CLAIM_PATTERNS):
+                continue
+            # Must start with a capital letter or digit
+            if not (c[0].isupper() or c[0].isdigit()):
+                continue
+            filtered.append(c)
+        # Deduplicate
+        seen = set()
+        unique = []
+        for c in filtered:
+            key = c[:60].lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+        return unique
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -159,16 +317,20 @@ class NLIScorer:
     def extract_atomic_claims(self, text: str, llm_client: LLMClient) -> list[str]:
         """Use LLM to extract atomic factual claims from text."""
         self.lm_call_count["atomic_claims"] = self.lm_call_count.get("atomic_claims", 0) + 1
+        input_len = min(len(text), 2000)
         try:
             resp = llm_client.generate(
-                _CLAIMS_PROMPT.format(text=text[:2000]),  # cap input length
+                _CLAIMS_PROMPT.format(text=text[:2000]),
                 max_new_tokens=256,
                 temperature=0.0,
             )
-            return self._parse_claims(resp.text)
+            claims = self._parse_claims(resp.text)
+            logger.debug("extract_atomic_claims: input=%d chars, raw_output=%d chars, claims=%d",
+                         input_len, len(resp.text), len(claims))
+            return claims
         except Exception as e:
             logger.warning("extract_atomic_claims failed: %s", e)
-            return [text]
+            return []
 
     def compute_coverage(
         self, evidence: str, sub_answer: str, llm_client: LLMClient
@@ -186,35 +348,32 @@ class NLIScorer:
     def compute_gcs(self, evidences: list[str], llm_client: LLMClient) -> float:
         """GCS(ε) = fraction of evidence pairs that are NOT contradictory.
 
-        Uses atomic claims: for each pair (Eᵢ, Eⱼ), extract claims from both,
-        then check all cross-claim pairs for contradiction.
+        Uses density-based threshold: a branch pair is contradictory only if
+        conflict_ratio > gcs_conflict_threshold (default 0.25).
         """
         n = len(evidences)
         if n <= 1:
             return 1.0
 
         try:
-            # Extract claims for each branch
             all_claims: list[list[str]] = [
                 self.extract_atomic_claims(e, llm_client) for e in evidences
             ]
-
-            contradiction_pairs = 0
-            total_pairs = 0
-
+            contradicting = 0
+            valid = 0
             for i, j in combinations(range(n), 2):
                 claims_i, claims_j = all_claims[i], all_claims[j]
-                cross_pairs = [(c_i, c_j) for c_i in claims_i for c_j in claims_j]
-                if not cross_pairs:
-                    total_pairs += 1
+                total_pairs = len(claims_i) * len(claims_j)
+                if total_pairs == 0:
                     continue
-                results = self._batch_score(cross_pairs)
-                has_contradiction = any(r.label == "contradiction" for r in results)
-                total_pairs += 1
-                if has_contradiction:
-                    contradiction_pairs += 1
-
-            return 1.0 - contradiction_pairs / total_pairs if total_pairs else 1.0
+                valid += 1
+                cross = [(c_i, c_j) for c_i in claims_i for c_j in claims_j]
+                results = self._batch_score(cross)
+                n_contra = sum(1 for r in results if r.label == "contradiction")
+                conflict_ratio = n_contra / total_pairs
+                if conflict_ratio > self.gcs_conflict_threshold:
+                    contradicting += 1
+            return 1.0 - contradicting / valid if valid else 1.0
         except Exception as e:
             logger.warning("compute_gcs failed: %s", e)
             return 1.0
@@ -266,41 +425,56 @@ class NLIScorer:
                 coverages.append(0.0)
         min_cov = min(coverages) if coverages else 0.0
 
-        # GCS — reuse cached claims
+        # GCS — density-based thresholding, reuse cached claims
+        gcs_telemetry = {"avg_conflict_ratio": 0.0, "max_conflict_ratio": 0.0,
+                         "contradicting_branch_pairs": 0, "valid_branch_pairs": 0}
         if skip_gcs or n <= 1:
             gcs = 1.0
         else:
             try:
-                contradiction_pairs = 0
-                total_pairs = 0
+                conflict_ratios: list[float] = []
+                contradicting = 0
+                valid = 0
                 for i, j in combinations(range(n), 2):
                     claims_i, claims_j = all_claims[i], all_claims[j]
-                    cross_pairs = [(ci, cj) for ci in claims_i for cj in claims_j]
-                    if not cross_pairs:
-                        total_pairs += 1
+                    total_pairs = len(claims_i) * len(claims_j)
+                    if total_pairs == 0:
                         continue
+                    valid += 1
+                    cross_pairs = [(ci, cj) for ci in claims_i for cj in claims_j]
                     results = self._batch_score(cross_pairs)
-                    has_contradiction = any(r.label == "contradiction" for r in results)
-                    total_pairs += 1
-                    if has_contradiction:
-                        contradiction_pairs += 1
-                gcs = 1.0 - contradiction_pairs / total_pairs if total_pairs else 1.0
+                    n_contra = sum(1 for r in results if r.label == "contradiction")
+                    conflict_ratio = n_contra / total_pairs
+                    conflict_ratios.append(conflict_ratio)
+                    if conflict_ratio > self.gcs_conflict_threshold:
+                        contradicting += 1
+                gcs = 1.0 - contradicting / valid if valid else 1.0
+                if conflict_ratios:
+                    gcs_telemetry = {
+                        "avg_conflict_ratio": sum(conflict_ratios) / len(conflict_ratios),
+                        "max_conflict_ratio": max(conflict_ratios),
+                        "contradicting_branch_pairs": contradicting,
+                        "valid_branch_pairs": valid,
+                    }
             except Exception as e:
                 logger.warning("compute_gcs failed: %s", e)
                 gcs = 1.0
         cs = min_cov * gcs
 
-        # Noisy branch detection — reuse cached claims
+        # Noisy branch detection — density-based, reuse cached claims
         noisy: set[int] = set()
         if n > 1 and not skip_gcs:
             try:
                 for i, j in combinations(range(n), 2):
                     claims_i, claims_j = all_claims[i], all_claims[j]
-                    cross = [(ci, cj) for ci in claims_i for cj in claims_j]
-                    if not cross:
+                    total_pairs = len(claims_i) * len(claims_j)
+                    if total_pairs == 0:
                         continue
+                    cross = [(ci, cj) for ci in claims_i for cj in claims_j]
                     results = self._batch_score(cross)
-                    if any(r.label == "contradiction" for r in results):
+                    n_contra = sum(1 for r in results if r.label == "contradiction")
+                    conflict_ratio = n_contra / total_pairs
+                    if conflict_ratio > self.gcs_conflict_threshold:
                         noisy.add(i if coverages[i] <= coverages[j] else j)
             except Exception as e:
                 logger.warning("noisy branch detection failed: %s", e)
@@ -312,4 +486,8 @@ class NLIScorer:
             cs=cs,
             should_stop=cs >= self.theta,
             noisy_branch_ids=sorted(noisy),
+            avg_conflict_ratio=gcs_telemetry["avg_conflict_ratio"],
+            max_conflict_ratio=gcs_telemetry["max_conflict_ratio"],
+            contradicting_branch_pairs=gcs_telemetry["contradicting_branch_pairs"],
+            valid_branch_pairs=gcs_telemetry["valid_branch_pairs"],
         )

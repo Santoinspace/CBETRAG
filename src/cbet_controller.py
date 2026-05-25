@@ -23,6 +23,7 @@ class CBETConfig:
     max_branches: int = 6
     nli_claim_extraction: bool = True
     skip_cross_branch_nli: bool = False  # ablation: no_cross_branch
+    gcs_conflict_threshold: float = 0.35  # density-based: branch pair contradictory if conflict_ratio > this
 
 
 @dataclass
@@ -296,6 +297,11 @@ class CBETController:
             "dag_size": len(dag.sub_questions),
             "branch_cs_scores": cs_result.branch_coverages if cs_result else [],
             "final_cs": cs_result.cs if cs_result else 0.0,
+            "gcs": cs_result.gcs if cs_result else 0.0,
+            "avg_conflict_ratio": cs_result.avg_conflict_ratio if cs_result else 0.0,
+            "max_conflict_ratio": cs_result.max_conflict_ratio if cs_result else 0.0,
+            "contradicting_branch_pairs": cs_result.contradicting_branch_pairs if cs_result else 0,
+            "valid_branch_pairs": cs_result.valid_branch_pairs if cs_result else 0,
             "conflicts_detected": conflicts_detected,
             "overrides_triggered": overrides_triggered,
             "noisy_evicted": noisy_evicted,
@@ -346,7 +352,9 @@ def _build_controller(args) -> "CBETController":
     else:
         model_path = os.path.join(args.model_path, "Qwen2.5-7B-Instruct-AWQ")
         llm = build_client(backend, model_path)
-    nli = NLIScorer(model_path=nli_path, theta=args.theta)
+    gcs_conflict_threshold = yaml_cfg.get("gcs_conflict_threshold", 0.35)
+    nli = NLIScorer(model_path=nli_path, theta=args.theta,
+                     gcs_conflict_threshold=gcs_conflict_threshold)
     probe = ParametricProbe(llm)
     es_index = getattr(args, "es_index_name", None) or yaml_cfg.get("es_index_name", "wiki")
     retriever = ElasticRetriever(index_name=es_index)
@@ -356,6 +364,7 @@ def _build_controller(args) -> "CBETController":
         tau=args.tau,
         max_iterations=args.max_iterations,
         nli_claim_extraction=(args.ablation != "entropy_only"),
+        gcs_conflict_threshold=gcs_conflict_threshold,
     )
     # Ablation: no_cross_branch → skip cross-branch GCS (always 1.0)
     if args.ablation == "no_cross_branch":

@@ -202,9 +202,11 @@ def baseline_cbet(q: Question, llm: VLLMClient, retriever: DatasetPassageRetriev
 
     start = time.time()
 
-    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="cpu", theta=0.75)
+    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="cpu", theta=0.50,
+                     gcs_conflict_threshold=0.35)
     probe = ParametricProbe(llm)
-    config = CBETConfig(theta=0.75, tau=0.5, max_iterations=3, max_branches=6)
+    config = CBETConfig(theta=0.50, tau=0.5, max_iterations=3, max_branches=6,
+                        gcs_conflict_threshold=0.35)
     controller = CBETController(llm, retriever, nli, probe, config)
 
     result = controller.solve(q)

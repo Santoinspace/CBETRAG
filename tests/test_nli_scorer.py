@@ -31,6 +31,8 @@ def _make_scorer(label_probs: dict[str, list[float]]) -> NLIScorer:
     scorer.device = "cpu"
     scorer.batch_size = 16
     scorer.theta = 0.75
+    scorer.gcs_conflict_threshold = 0.35
+    scorer.lm_call_count = {}
 
     # Mock tokenizer
     tok = MagicMock()
@@ -66,6 +68,8 @@ def _scorer_with_logits(logits_fn) -> NLIScorer:
     scorer.device = "cpu"
     scorer.batch_size = 16
     scorer.theta = 0.75
+    scorer.gcs_conflict_threshold = 0.35
+    scorer.lm_call_count = {}
     tok = MagicMock()
     tok.encode.return_value = list(range(10))
     tok.decode.return_value = "text"
@@ -85,19 +89,24 @@ def test_nliresult_label_fields():
 
 def test_parse_claims_valid_json():
     scorer = _scorer_with_logits(lambda pairs: [])
-    claims = scorer._parse_claims('{"claims": ["A is B", "C is D"]}')
-    assert claims == ["A is B", "C is D"]
+    claims = scorer._parse_claims(
+        '{"claims": ["Alpha is the first letter", "Beta is the second letter"]}')
+    assert claims == ["Alpha is the first letter", "Beta is the second letter"]
 
 
 def test_parse_claims_markdown_fence():
     scorer = _scorer_with_logits(lambda pairs: [])
-    raw = '```json\n{"claims": ["X"]}\n```'
-    assert scorer._parse_claims(raw) == ["X"]
+    raw = '```json\n{"claims": ["X-ray imaging is a medical technique"]}\n```'
+    assert scorer._parse_claims(raw) == ["X-ray imaging is a medical technique"]
 
 
 def test_parse_claims_fallback():
     scorer = _scorer_with_logits(lambda pairs: [])
-    assert scorer._parse_claims("not json") == ["not json"]
+    # Purely unstructured text — falls through to sentence split or final fallback
+    claims = scorer._parse_claims(
+        "This is a valid claim sentence that meets the length filter. "
+        "The Berlin Wall fell in November 1989.")
+    assert len(claims) >= 1  # At least one claim from sentence split
 
 
 def test_gcs_single_branch():
@@ -119,12 +128,12 @@ def test_gcs_consistent_evidences():
 
 
 def test_gcs_contradictory_evidences():
-    """All pairs contradict → GCS = 0.0."""
+    """All pairs contradict → GCS = 0.0 (conflict_ratio=1.0 > 0.35)."""
     def always_contradiction(pairs):
         return [NLIResult("contradiction", 0.05, 0.05, 0.9) for _ in pairs]
 
     scorer = _scorer_with_logits(always_contradiction)
-    llm = MockLLM(["claim 1"])
+    llm = MockLLM(["Claim one is long enough claim", "Claim two is also long enough claim"])
     gcs = scorer.compute_gcs(["evidence A", "evidence B"], llm)
     assert gcs == pytest.approx(0.0)
 
@@ -183,7 +192,7 @@ def test_completeness_should_stop_when_cs_high():
 
     scorer = _scorer_with_logits(high)
     scorer.theta = 0.75
-    llm = MockLLM(["claim"])
+    llm = MockLLM(["Claim one with enough words to pass the length filter"])
     result = scorer.compute_completeness_score(["ev1"], ["ans1"], ["q1"], llm)
     assert result.should_stop is True
 
@@ -194,33 +203,38 @@ def test_completeness_should_not_stop_when_cs_low():
 
     scorer = _scorer_with_logits(low)
     scorer.theta = 0.75
-    llm = MockLLM(["claim"])
+    llm = MockLLM(["A claim with enough words to pass the length filter"])
     result = scorer.compute_completeness_score(["ev1"], ["ans1"], ["q1"], llm)
     assert result.should_stop is False
 
 
 def test_noisy_branch_marked_lower_coverage():
-    """When branches contradict, the lower-coverage branch is marked noisy."""
-    call_count = [0]
+    """When cross-claim conflict_ratio > threshold, lower-coverage branch marked noisy."""
+    pair_call = []
 
-    def contradiction_then_entailment(pairs):
-        call_count[0] += 1
+    def mixed_scores(pairs):
+        pair_call.append(len(pairs))
+        # First call is coverage (claim→answer), second is noisy detection (cross-claims)
+        if len(pair_call) <= 2:
+            # Coverage: return entailment (high for first branch)
+            if len(pair_call) == 1:
+                return [NLIResult("entailment", 0.2, 0.1, 0.7) for _ in pairs]
+            else:
+                return [NLIResult("entailment", 0.9, 0.05, 0.05) for _ in pairs]
+        # Noisy detection: return all contradictions → conflict_ratio=1.0 > 0.35
         return [NLIResult("contradiction", 0.05, 0.05, 0.9) for _ in pairs]
 
-    scorer = _scorer_with_logits(contradiction_then_entailment)
+    scorer = _scorer_with_logits(mixed_scores)
     scorer.theta = 0.75
 
-    # Branch 0 has lower coverage (0.2), branch 1 has higher (0.8)
-    # We override compute_coverage to return fixed values
-    scorer.compute_coverage = lambda ev, ans, llm: 0.2 if ev == "ev_low" else 0.8
-
-    llm = MockLLM(["claim"])
+    llm = MockLLM(["Claim one with enough length here", "Claim two also long enough"])
     result = scorer.compute_completeness_score(
         branch_evidences=["ev_low", "ev_high"],
         branch_answers=["ans1", "ans2"],
         sub_questions=["q1", "q2"],
         llm_client=llm,
     )
+    # Branch 0 has lower coverage (0.2 < 0.9), should be marked noisy
     assert 0 in result.noisy_branch_ids
 
 
@@ -291,7 +305,7 @@ class TestNLIScorerIntegration:
         assert cov > 0.7, f"Expected Cov > 0.7 for relevant evidence, got {cov}"
 
     def test_coverage_irrelevant_below_threshold(self, scorer, llm):
-        evidence = "Paris is the capital of France."
-        answer = "1989"
+        evidence = "The Eiffel Tower was built in Paris between 1887 and 1889."
+        answer = "Amsterdam is the capital of the Netherlands"
         cov = scorer.compute_coverage(evidence, answer, llm)
         assert cov < 0.3, f"Expected Cov < 0.3 for irrelevant evidence, got {cov}"
