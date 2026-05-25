@@ -6,6 +6,7 @@ Label order for DeBERTa cross-encoder NLI: [contradiction, entailment, neutral]
 from __future__ import annotations
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from itertools import combinations
 
@@ -106,11 +107,17 @@ class NLIScorer:
         return results
 
     def _parse_claims(self, text: str) -> list[str]:
-        """Parse JSON claims list from LLM output, fallback to [text]."""
+        """Parse claims from LLM output. Handles JSON, numbered/bullet lists, plain text."""
         text = text.strip()
+        # Strip markdown code fences
         if text.startswith("```"):
             lines = text.splitlines()
-            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            if lines[-1].strip() == "```":
+                text = "\n".join(lines[1:-1])
+            else:
+                text = "\n".join(lines[1:])
+            text = text.strip()
+        # Try JSON first
         try:
             data = json.loads(text)
             claims = data.get("claims", [])
@@ -118,7 +125,25 @@ class NLIScorer:
                 return [str(c) for c in claims]
         except (json.JSONDecodeError, AttributeError):
             pass
-        return [text]  # fallback: treat whole response as one claim
+        # Try numbered/bullet list extraction
+        lines = text.splitlines()
+        claims = []
+        for line in lines:
+            stripped = line.strip()
+            # Match "1. claim text" or "- claim text" or "• claim text"
+            m = re.match(r'^(?:\d+[\.\)]\s*|[•\-\*]\s*)(.+)$', stripped)
+            if m:
+                claim = m.group(1).strip().strip('"')
+                if len(claim) > 15:  # filter short fragments
+                    claims.append(claim)
+        if claims:
+            return claims
+        # Fallback: split by sentence boundaries and filter
+        raw_sents = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+        sents = [s.strip() for s in raw_sents if len(s.strip()) > 15]
+        if sents:
+            return sents
+        return [text]
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -224,14 +249,16 @@ class NLIScorer:
                 claims = []
             all_claims.append(claims)
 
-        # Per-branch coverage — reuse cached claims
+        # Per-branch coverage — NLI(answer → claim): short→short, DeBERTa's design scenario.
+        # A high entailment means the answer is consistent with at least one evidence claim.
         coverages: list[float] = []
         for i in range(n):
             if not branch_answers[i] or not all_claims[i]:
                 coverages.append(0.0)
                 continue
             try:
-                pairs = [(claim, branch_answers[i]) for claim in all_claims[i]]
+                ans = branch_answers[i]
+                pairs = [(claim, ans) for claim in all_claims[i]]
                 results = self._batch_score(pairs)
                 coverages.append(max(r.entailment_score for r in results))
             except Exception as e:

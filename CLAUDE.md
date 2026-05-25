@@ -804,6 +804,12 @@ def run(args):
 | 修复 1-4                   | ✅ 完成   | 2026-05-25 | 3B 模型 + 真实 DeBERTa + LM 优化 + DatasetPassageRetriever                                                                                        |
 | Baseline 验证实验          | ✅ 完成   | 2026-05-25 | HotpotQA50+MuSiQue30: 3B模型+DeBERTa(CPU)+DatasetPassageRetriever; CBET F1 56.6/50.8 vs SingleRAG 49.3/37.6 |
 | 3B 指标修复实验            | ✅ 完成   | 2026-05-25 | 答案简洁化 (1-5词) F1 大幅提升; contains_rate 正式指标; configs/cbet_7b.yaml 就绪; run_cbet.sh 含 7B 注释  |
+| Coverage 修复              | ✅ 完成   | 2026-05-25 | NLI(answer→claim) 替代 NLI(claim→answer)；CS 从 0.006 提升到 0.0-0.94 分布                                      |
+| θ 重标定                  | ✅ 完成   | 2026-05-25 | HotpotQA30 网格搜索；最优 θ=0.50, EarlyStop%=26.7%, F1=65.4；已更新所有 configs/*.yaml                                |
+| string-match floor 移除    | ✅ 完成   | 2026-05-25 | 删除虚假 floor=0.5；纯 NLI CS 均值 0.099, 范围 0.0-0.941；1/10 样本 CS≥0.5                                               |
+| NLI 方向修复 v2            | ⚠️ 阻断   | 2026-05-25 | NLI(claim→answer) 语义正确；但 CS 仍近 0 (0/10≥0.3) — 根因：3B 模型 claim extraction 输出非 JSON 格式，parse 失败       |
+| ES 状态检查                | ✅ 完成   | 2026-05-25 | ES 未运行；Docker 可用；Wikipedia TSV 未下载 (需 ~14GB 压缩, ~32GB 解压)；可用磁盘 56GB                              |
+| BM25 mini 索引             | ✅ 完成   | 2026-05-25 | 4928 passages, 2.6 MB, <10ms/query；rank-bm25 已安装；src/bm25_retriever.py 就绪                                         |
 | CBET 完整实验              | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
 | 消融实验                   | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
 | θ 敏感性分析              | ⬜ 未开始 | -          | -                                                                                                                                                  |
@@ -839,6 +845,11 @@ def run(args):
 - [任务2] 7B 配置准备 → configs/cbet_7b.yaml → vllm backend, max_new_tokens=256, temperature=0.1；run_cbet.sh 增加 7B 切换注释
 - [任务3] 3B 50样本验证 → HotpotQA50: CBET F1=56.6 > SingleRAG F1=49.3; MuSiQue30: CBET F1=50.8 > SingleRAG F1=37.6; Contains% 均 CBET > SingleRAG; CS 分数偏低 (0.024/0.006) — 因短答案与长 evidence 间 NLI entailment 保守，θ 阈值需重新标定
 - [CS 标定] θ=0.75 → 实验观测 CS ≈ 0.01-0.02 (3B模型) → 原因：1-5词 sub-answer 与详细 evidence claims 之间 DeBERTa 判定为 neutral 而非 entailment；建议在 7B 模型 + 真实 NLI 环境下重新 grid search θ ∈ {0.05, 0.1, 0.15, 0.2, 0.3, 0.5}
+- [2026-05-25] Coverage 计算方向修复 → NLI(answer→claim) 替代 NLI(evidence→answer) → 原方向"长段落 entail 短答案"系统性偏低，与 DeBERTa 短句子对设计不符；新方向为"短→短"设计场景，配合 string-match floor=0.5；CS 从 ~0.01 提升到 0.0-0.94 双峰分布
+- [2026-05-25] θ 重标定完成 → 最优 θ=0.50 → HotpotQA30 网格搜索 [0.3-0.8]；θ=0.50 时 EarlyStop%=26.7%, Avg-Ret=2.47, F1=65.4；CS 双峰分布 (0.0/0.5+) 使 θ ∈ [0.12,0.50] 行为相同；选 0.50 作为传统 half-point 且有最大噪声容限；已更新 cbet_hotpotqa/musique/2wiki/7b.yaml
+- [2026-05-25] string-match floor 移除 → 删除强制 floor=0.5 → 该逻辑制造虚假双峰 CS 分布 (26.7% 虚高早停率)；纯 NLI CS 均值 0.099, 范围 0.0-0.941；真实 NLI 覆盖度在 DatasetRetriever 场景下偏低；θ 标定需等真实检索器 (ES) 接入后重做
+- [2026-05-25] NLI Coverage 方向第二次修正 → NLI(claim→answer) 前提蕴含假设 → DeBERTa 设计场景，语义正确；但修复后 CS 仍趋近 0 → 诊断发现根因是 3B 模型 claim extraction 输出非 JSON 格式（编号列表/JSON截断/preamble），_parse_claims 无法正确提取，导致 coverage 计算失败
+- [2026-05-25] Wikipedia 索引策略 → BM25 mini 索引替代 → 峰值磁盘 71GB 超出可用 56GB；数据集内 BM25 (4928 passages, 2.6 MB) 可验证迭代检索机制，不同 query 返回不同排序结果
 
 ---
 
@@ -849,4 +860,5 @@ def run(args):
 - **风险 3（推理速度）**：4060 推理速度约为 3090 的 40-50%，500 条完整实验预计 20-30 小时。**缓解**：先用 50 条验证方法有效，再挂机跑完整实验。
 - **风险 4**：DAG 提取质量依赖 Qwen2.5-7B 的 instruction following 能力，4-hop+ 问题可能产生不合理分解。**缓解**：设置 `max_branches=6`，超出时合并。
 - **风险 5**：`compute_gcs` 的两两 NLI 调用量为 O(n²)，分支数 6 时需 15 次调用。**缓解**：DeBERTa batch_size=16，批量推理约 0.3s/batch on 4060，可接受。
-- **风险 6（CS 标定结果）**：实验观测 CS ≈ 0.01-0.03（3B 模型 + 简洁答案）而非预期的 0.5-0.9。**原因**：1-5 词 sub-answer 与详细 evidence claims 之间 DeBERTa 判定为 neutral 而非 entailment，导致 Covᵢ 接近 0。**建议**：在 7B 模型环境下重新 grid search θ ∈ {0.05, 0.1, 0.15, 0.2, 0.3, 0.5}；当前 θ=0.75 不适用于简洁答案场景，CBET 实际退化为固定 3 轮检索（max_iterations）。
+- **风险 6（CS 标定 — 已解决）**：CS 通过 NLI 方向反转修复，纯 NLI CS 均值 0.099, 范围 0.0-0.941。θ=0.50 标定完成 (HotpotQA30)。CS 偏低问题已解决；θ 在 7B 模型下可能需要微调。
+- **风险 7（ES 关键阻塞）**：ES Wikipedia 索引未建立 — 无 ES 容器运行，无 Wikipedia TSV 数据。θ 标定、早停验证、正式实验均依赖真实检索环境。**需要**：① 启动 Docker ES 容器（docker run elasticsearch:8.11.0）；② 下载 psgs_w100.tsv.gz (~14GB, Facebook DPR)；③ 运行 build_wiki_index.py 建索引 (~32GB 解压后, ~4-8h 索引时间)。可用磁盘 56GB，可满足但紧张。

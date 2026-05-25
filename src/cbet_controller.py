@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CBETConfig:
-    theta: float = 0.75
+    theta: float = 0.50
     tau: float = 0.5
     max_iterations: int = 5
     max_branches: int = 6

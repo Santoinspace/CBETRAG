@@ -3,7 +3,7 @@ nli_model_path: ./models/nli-deberta-v3-base
 backend: awq
 dataset: 2wikimultihopqa
 data_path: ./AdaRAGUE/data/adaptive_rag_2wikimultihopqa/test.csv
-theta: 0.75
+theta: 0.50
 tau: 0.5
 max_iterations: 5
 max_branches: 6
