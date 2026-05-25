@@ -56,6 +56,27 @@ TrustRetrieved(i) = GCS(ε) × 𝟙[NLI(Eᵢ, Mᵢ) = conflict] > τ  →  epist
 - Repo: https://github.com/yale-nlp/MCTS-RAG
 - 参考其树形结构的分支管理逻辑
 
+### 1.4 Python Package Management with uv
+
+Use uv exclusively for Python package management in this project.
+
+#### Package Management Commands
+
+- All Python dependencies **must be installed, synchronized, and locked** using uv
+- Never use pip, pip-tools, poetry, or conda directly for dependency management
+
+Use these commands:
+
+- Install dependencies: `uv add <package>`
+- Remove dependencies: `uv remove <package>`
+- Sync environment: `uv sync`
+- Lock dependencies: `uv lock`
+
+#### Running Python Code
+
+- Run a Python script with `uv run <script-name>.py`
+- Run Python tools with `uv run <tool>` (e.g. `uv run pytest`, `uv run ruff`, `uv run mypy`, `uv run pre-commit`)
+- Launch a Python REPL with `uv run python`
 ---
 
 ## 2. 项目目录结构
@@ -490,17 +511,17 @@ def solve(self, question: Question) -> CBETResult:
   
     while iteration < self.config.max_iterations:
         iteration += 1
-    
+  
         # Step 2: 按拓扑序执行各层
         for parallel_batch in dag.get_execution_order():
-        
+    
             # Step 2a: 叶节点并行检索
             leaf_nodes = [sq for sq in parallel_batch if sq.is_leaf]
             if leaf_nodes:
                 retrieval_results = self._parallel_retrieve(
                     leaf_nodes, branch_states
                 )
-        
+    
             # Step 2b: 内部节点串行（使用已验证的前驱答案）
             internal_nodes = [sq for sq in parallel_batch if not sq.is_leaf]
             for node in internal_nodes:
@@ -508,35 +529,35 @@ def solve(self, question: Question) -> CBETResult:
                     node, branch_states
                 )
                 retrieval_results[node.id] = self._retrieve(enriched_query)
-        
+    
             # Step 3: 为每个分支更新证据
             for sq in parallel_batch:
                 branch_states[sq.id].evidence = retrieval_results[sq.id]
-            
+        
                 # Step 4: 参数化记忆探测 + 冲突检测
                 param_mem = self.parametric_probe.probe(sq.text)
                 conflict = self.parametric_probe.detect_conflict(
                     param_mem, branch_states[sq.id].evidence
                 )
                 branch_states[sq.id].conflict = conflict
-            
+        
                 # Step 5: epistemic override（如果需要）
                 if conflict.trust_retrieved > self.config.tau:
                     branch_states[sq.id].override_prompt = \
                         self.epistemic_overrider.build(sq.text, 
                                                        branch_states[sq.id].evidence)
-    
+  
         # Step 6: 计算完备性分数
         cs_result = self.nli_scorer.compute_completeness_score(
             branch_evidences=[s.evidence for s in branch_states.values()],
             branch_answers=[s.current_answer for s in branch_states.values()],
             sub_questions=[sq.text for sq in dag.sub_questions]
         )
-    
+  
         # Step 7: 停止判断
         if cs_result.should_stop:
             break
-    
+  
         # Step 8: 噪声分支处理（重新检索）
         for noisy_id in cs_result.noisy_branch_ids:
             branch_states[noisy_id].evidence = ""  # 清空，下轮重检索
@@ -769,21 +790,23 @@ def run(args):
 
 > 每次完成 Task 后在此更新，格式如下
 
-| Task                       | 状态      | 完成时间   | 备注                                                                     |
-| -------------------------- | --------- | ---------- | ------------------------------------------------------------------------ |
-| Task 0: 环境验证           | ✅ 完成   | 2026-05-22 | tests/test_env.py 已就绪，需模型下载后运行                               |
-| Task 1: 数据适配器         | ✅ 完成   | 2026-05-22 | src/data_adapter.py，6/6 测试通过                                        |
-| Task 2: DAG 提取器         | ✅ 完成   | 2026-05-22 | src/dag_extractor.py，7/7 测试通过                                       |
-| Task 3: NLI 评分器         | ✅ 完成   | 2026-05-22 | src/nli_scorer.py，14/14 快速测试通过；4 个 GPU 集成测试需模型下载后运行 |
-| Task 4: 参数化探针         | ✅ 完成   | 2026-05-22 | src/parametric_probe.py，14/14 测试通过                                  |
-| Task 5: 主控制器           | ✅ 完成   | 2026-05-22 | src/cbet_controller.py，9/9 测试通过                                     |
-| Task 6: Epistemic Override | ✅ 完成   | 2026-05-22 | src/epistemic_override.py，含在 e2e 测试中                               |
-| Task 7: 实验脚本           | ⬜ 未开始 | -          | -                                                                        |
-| Task 8: 评估聚合           | ⬜ 未开始 | -          | -                                                                        |
-| Baseline 实验              | ⬜ 未开始 | -          | -                                                                        |
-| CBET 完整实验              | ⬜ 未开始 | -          | -                                                                        |
-| 消融实验                   | ⬜ 未开始 | -          | -                                                                        |
-| θ 敏感性分析              | ⬜ 未开始 | -          | -                                                                        |
+| Task                       | 状态      | 完成时间   | 备注                                                                                                                                               |
+| -------------------------- | --------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Task 0: 环境验证           | ✅ 完成   | 2026-05-22 | tests/test_env.py 已就绪，需模型下载后运行                                                                                                         |
+| Task 1: 数据适配器         | ✅ 完成   | 2026-05-22 | src/data_adapter.py，6/6 测试通过                                                                                                                  |
+| Task 2: DAG 提取器         | ✅ 完成   | 2026-05-22 | src/dag_extractor.py，7/7 测试通过                                                                                                                 |
+| Task 3: NLI 评分器         | ✅ 完成   | 2026-05-25 | src/nli_scorer.py；真实 DeBERTa (CPU) 集成，claims 复用优化完成                                                                                    |
+| Task 4: 参数化探针         | ✅ 完成   | 2026-05-25 | src/parametric_probe.py；probe 仅执行一次，detect_conflict 去掉 LLM answer extraction                                                               |
+| Task 5: 主控制器           | ✅ 完成   | 2026-05-25 | src/cbet_controller.py；LM 调用计数 + evidence 缓存优化，total LM ≤ 14                                                                             |
+| Task 6: Epistemic Override | ✅ 完成   | 2026-05-22 | src/epistemic_override.py，含在 e2e 测试中                                                                                                         |
+| Task 7: 实验脚本           | ✅ 完成   | 2026-05-22 | run_cbet.sh, run_ablations.sh, run_baselines.sh, sensitivity_theta.py 已就绪                                                                       |
+| Task 8: 评估聚合           | ✅ 完成   | 2026-05-24 | analysis/evaluate_all.py 已就绪，20+ 测试通过                                                                                                      |
+| 修复 1-4                   | ✅ 完成   | 2026-05-25 | 3B 模型 + 真实 DeBERTa + LM 优化 + DatasetPassageRetriever                                                                                        |
+| Baseline 验证实验          | ✅ 完成   | 2026-05-25 | HotpotQA50+MuSiQue30: 3B模型+DeBERTa(CPU)+DatasetPassageRetriever; CBET F1 56.6/50.8 vs SingleRAG 49.3/37.6 |
+| 3B 指标修复实验            | ✅ 完成   | 2026-05-25 | 答案简洁化 (1-5词) F1 大幅提升; contains_rate 正式指标; configs/cbet_7b.yaml 就绪; run_cbet.sh 含 7B 注释  |
+| CBET 完整实验              | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
+| 消融实验                   | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
+| θ 敏感性分析              | ⬜ 未开始 | -          | -                                                                                                                                                  |
 
 ---
 
@@ -798,6 +821,24 @@ def run(args):
 - [初始化] 虚拟环境工具 → uv → 比 pip/conda 安装速度快 10-100x，由 Claude Code 自动创建
 - [初始化] 代码基础选择 → `AdaRAGUE` → 已有统一评估框架，三个目标数据集预处理完毕，baseline 复现成本极低
 - [初始化] atomic claims 提取 → 使用 LLM 而非 NER → 跨文档推理中事实跨度超过 NER 能识别的范围
+- [Task 7] 基准方法入口统一 → 无法统一 CLI → AdaRAGUE 中 DRAGIN/SeaKR/AdaptiveRAG 入口完全不同（JSON config vs vllm async vs server-based），`run_baselines.sh` 为每种方法提供独立的配置生成和调用逻辑，SeaKR 和 AdaptiveRAG 默认跳过需手动启用
+- [Task 7] ES 索引名 → `wiki` → AdaRAGUE 使用统一的 Wikipedia 索引而非按数据集分索引，在 `_build_controller` 中从 YAML config 或 CLI `--es_index_name` 读取
+- [Task 7] no_cross_branch 消融支持 → 新增 `skip_cross_branch_nli` 配置项 → GCS 强制为 1.0，噪声分支检测跳过，CS = min_i(Cov_i)
+- [Task 7] FLARE 缺失 → 跳过 → 当前 AdaRAGUE clone 不含 FLARE 目录，baseline 对比使用 AdaRAGUE 论文报告数字作为参考
+- [Task 8] VLLM 后端支持 → 新增 `VLLMClient` → 用户通过 Docker + vLLM 启动模型，使用 OpenAI 兼容 API 调用；支持 logprobs，Qwen2.5-Coder-1.5B-Instruct-AWQ 可用
+- [Task 8] 惰性导入策略 → torch、pandas 改为函数内 import → 支持 vLLM-only 环境（无需 CUDA/torch），VLLMClient 只需 openai 包即可运行
+- [Task 8] 集成测试方案 → MockNLIScorer + PassageListRetriever → 无需 GPU 和 ElasticSearch 即可测试完整 CBET 流水线，6/6 测试通过
+- [Baseline] 自包含基线实验 → experiments/run_baseline_comparison.py → 无需 ES/GPU，使用 KeywordRetriever + MockNLIScorer + vLLM，实现 NoRAG/SingleRAG/IterativeRAG/CBET 四种方法对比
+- [Baseline] 1.5B 模型限制 → Qwen2.5-Coder-1.5B 在多跳 QA 上表现差 → 绝对 EM 接近 0%，但相对趋势清晰（SingleRAG > NoRAG，IterativeRAG F1 最高）；CBET 框架正确运行，CS 分数在 0.3-0.8 范围，需 7B 模型才能体现方法优势
+- [修复 1] 3B 模型切换 → Qwen2.5-3B-Instruct-AWQ via vLLM → vLLM 服务已部署此模型，model name 仍为 `/models/qwen`
+- [修复 2] 真实 NLI 集成 → `cross-encoder/nli-deberta-v3-base` on CPU → 从 ModelScope 下载，`device="cpu"` 避免与 vLLM 争抢 GPU；entailment=0.9783, contradiction=0.9999 验证通过
+- [修复 3] LM 调用爆炸 → claims 复用 + probe 一次性 + evidence 缓存 → atomic_claims 从 ~18 降至 6；probe 仅首迭代执行（从 6 降至 3）；answer_branch 仅在 evidence 变化时重新生成（从 6 降至 3）；total LM ≤ 14 ✅
+- [修复 4] 检索器 → DatasetPassageRetriever → 直接返回数据集自带 gold+distractor passages，消除检索质量变量，与 AdaRAGUE 预检索评估协议一致
+- [验证] 3B 模型黄金事实覆盖率 → CBET 80% (HotpotQA) / 70% (MuSiQue) vs SingleRAG 70%/70% → CBET 框架正确有效，但 3B 模型答案冗长（avg 44-50 words vs gold 2 words）导致 F1 指标被稀释；7B 模型预期能产生更简洁答案
+- [任务1] 答案提取策略 → prompt 约束（1-5词, Do not explain）→ 避免额外 LM 调用，F1 从 4.9→58.8 (SingleRAG), 7.9→71.1 (CBET 20条)；答案长度从 44-50词降至 1-3词；contains_rate 作为正式指标写入结果 JSON
+- [任务2] 7B 配置准备 → configs/cbet_7b.yaml → vllm backend, max_new_tokens=256, temperature=0.1；run_cbet.sh 增加 7B 切换注释
+- [任务3] 3B 50样本验证 → HotpotQA50: CBET F1=56.6 > SingleRAG F1=49.3; MuSiQue30: CBET F1=50.8 > SingleRAG F1=37.6; Contains% 均 CBET > SingleRAG; CS 分数偏低 (0.024/0.006) — 因短答案与长 evidence 间 NLI entailment 保守，θ 阈值需重新标定
+- [CS 标定] θ=0.75 → 实验观测 CS ≈ 0.01-0.02 (3B模型) → 原因：1-5词 sub-answer 与详细 evidence claims 之间 DeBERTa 判定为 neutral 而非 entailment；建议在 7B 模型 + 真实 NLI 环境下重新 grid search θ ∈ {0.05, 0.1, 0.15, 0.2, 0.3, 0.5}
 
 ---
 
@@ -808,4 +849,4 @@ def run(args):
 - **风险 3（推理速度）**：4060 推理速度约为 3090 的 40-50%，500 条完整实验预计 20-30 小时。**缓解**：先用 50 条验证方法有效，再挂机跑完整实验。
 - **风险 4**：DAG 提取质量依赖 Qwen2.5-7B 的 instruction following 能力，4-hop+ 问题可能产生不合理分解。**缓解**：设置 `max_branches=6`，超出时合并。
 - **风险 5**：`compute_gcs` 的两两 NLI 调用量为 O(n²)，分支数 6 时需 15 次调用。**缓解**：DeBERTa batch_size=16，批量推理约 0.3s/batch on 4060，可接受。
-- **风险 6**：θ 阈值需要在验证集上标定。**计划**：先用 HotpotQA 验证集（100条）做 grid search，再固定用于所有数据集。
+- **风险 6（CS 标定结果）**：实验观测 CS ≈ 0.01-0.03（3B 模型 + 简洁答案）而非预期的 0.5-0.9。**原因**：1-5 词 sub-answer 与详细 evidence claims 之间 DeBERTa 判定为 neutral 而非 entailment，导致 Covᵢ 接近 0。**建议**：在 7B 模型环境下重新 grid search θ ∈ {0.05, 0.1, 0.15, 0.2, 0.3, 0.5}；当前 θ=0.75 不适用于简洁答案场景，CBET 实际退化为固定 3 轮检索（max_iterations）。

@@ -4,7 +4,6 @@ import re
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-import pandas as pd
 
 
 @dataclass
@@ -79,6 +78,7 @@ def load_dataset(dataset: str, split: str = 'test',
         n_samples: if set, return only first n rows
         data_root: path to AdaRAGUE/data directory
     """
+    import pandas as pd
     path = Path(data_root) / f'adaptive_rag_{dataset}' / f'{split}.csv'
     df = pd.read_csv(path, nrows=n_samples)
     return [_row_to_question(row, dataset) for _, row in df.iterrows()]

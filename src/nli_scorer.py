@@ -9,9 +9,6 @@ import logging
 from dataclasses import dataclass, field
 from itertools import combinations
 
-import torch
-import torch.nn.functional as F
-
 from src.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -63,6 +60,7 @@ class NLIScorer:
             .to(device)
             .eval()
         )
+        self.lm_call_count: dict[str, int] = {}
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
@@ -77,6 +75,8 @@ class NLIScorer:
 
     def _batch_score(self, pairs: list[tuple[str, str]]) -> list[NLIResult]:
         """Run NLI on a list of (premise, hypothesis) pairs in batches."""
+        import torch
+        import torch.nn.functional as F
         results: list[NLIResult] = []
         for i in range(0, len(pairs), self.batch_size):
             batch = pairs[i : i + self.batch_size]
@@ -133,6 +133,7 @@ class NLIScorer:
 
     def extract_atomic_claims(self, text: str, llm_client: LLMClient) -> list[str]:
         """Use LLM to extract atomic factual claims from text."""
+        self.lm_call_count["atomic_claims"] = self.lm_call_count.get("atomic_claims", 0) + 1
         try:
             resp = llm_client.generate(
                 _CLAIMS_PROMPT.format(text=text[:2000]),  # cap input length
@@ -199,36 +200,80 @@ class NLIScorer:
         branch_answers: list[str],
         sub_questions: list[str],
         llm_client: LLMClient,
+        skip_gcs: bool = False,
     ) -> CompletenessResult:
-        """CS = min_i(Cov_i) × GCS.  Identifies noisy (contradictory) branches."""
+        """CS = min_i(Cov_i) × GCS.  Identifies noisy (contradictory) branches.
+
+        When skip_gcs=True (no_cross_branch ablation), GCS is forced to 1.0
+        and noisy branch detection is skipped.
+
+        Claims are extracted once per evidence and reused across coverage,
+        GCS, and noisy-branch detection.
+        """
         n = len(branch_evidences)
 
-        # Per-branch coverage
-        coverages = [
-            self.compute_coverage(branch_evidences[i], branch_answers[i], llm_client)
-            if branch_answers[i]
-            else 0.0
-            for i in range(n)
-        ]
+        # Extract atomic claims ONCE per evidence (was 3x before: coverage + gcs + noisy)
+        all_claims: list[list[str]] = []
+        for i in range(n):
+            if branch_evidences[i]:
+                try:
+                    claims = self.extract_atomic_claims(branch_evidences[i], llm_client)
+                except Exception:
+                    claims = [branch_evidences[i]]
+            else:
+                claims = []
+            all_claims.append(claims)
 
-        gcs = self.compute_gcs(branch_evidences, llm_client)
+        # Per-branch coverage — reuse cached claims
+        coverages: list[float] = []
+        for i in range(n):
+            if not branch_answers[i] or not all_claims[i]:
+                coverages.append(0.0)
+                continue
+            try:
+                pairs = [(claim, branch_answers[i]) for claim in all_claims[i]]
+                results = self._batch_score(pairs)
+                coverages.append(max(r.entailment_score for r in results))
+            except Exception as e:
+                logger.warning("compute_coverage failed: %s", e)
+                coverages.append(0.0)
         min_cov = min(coverages) if coverages else 0.0
+
+        # GCS — reuse cached claims
+        if skip_gcs or n <= 1:
+            gcs = 1.0
+        else:
+            try:
+                contradiction_pairs = 0
+                total_pairs = 0
+                for i, j in combinations(range(n), 2):
+                    claims_i, claims_j = all_claims[i], all_claims[j]
+                    cross_pairs = [(ci, cj) for ci in claims_i for cj in claims_j]
+                    if not cross_pairs:
+                        total_pairs += 1
+                        continue
+                    results = self._batch_score(cross_pairs)
+                    has_contradiction = any(r.label == "contradiction" for r in results)
+                    total_pairs += 1
+                    if has_contradiction:
+                        contradiction_pairs += 1
+                gcs = 1.0 - contradiction_pairs / total_pairs if total_pairs else 1.0
+            except Exception as e:
+                logger.warning("compute_gcs failed: %s", e)
+                gcs = 1.0
         cs = min_cov * gcs
 
-        # Identify noisy branches: involved in any contradiction → keep lower-coverage one
+        # Noisy branch detection — reuse cached claims
         noisy: set[int] = set()
-        if n > 1:
+        if n > 1 and not skip_gcs:
             try:
-                all_claims = [
-                    self.extract_atomic_claims(e, llm_client) for e in branch_evidences
-                ]
                 for i, j in combinations(range(n), 2):
-                    cross = [(ci, cj) for ci in all_claims[i] for cj in all_claims[j]]
+                    claims_i, claims_j = all_claims[i], all_claims[j]
+                    cross = [(ci, cj) for ci in claims_i for cj in claims_j]
                     if not cross:
                         continue
                     results = self._batch_score(cross)
                     if any(r.label == "contradiction" for r in results):
-                        # Mark the branch with lower coverage as noisy
                         noisy.add(i if coverages[i] <= coverages[j] else j)
             except Exception as e:
                 logger.warning("noisy branch detection failed: %s", e)

@@ -45,26 +45,28 @@ def _mean_token_entropy(logprobs: list[float]) -> float:
     return float(-sum(logprobs) / len(logprobs))
 
 
-def _extract_answer_from_evidence(evidence: str, llm_client: LLMClient) -> str:
-    """Ask LLM to extract the key factual answer from retrieved evidence."""
-    prompt = (
-        f"Extract the key factual answer from this evidence in one short phrase.\n"
-        f"Evidence: {evidence[:1000]}\nAnswer:"
-    )
-    try:
-        resp = llm_client.generate(prompt, max_new_tokens=64, temperature=0.0)
-        return resp.text.strip()
-    except Exception as e:
-        logger.warning("extract_answer_from_evidence failed: %s", e)
-        return evidence[:200]
+def _extract_answer_from_evidence(evidence: str, llm_client: LLMClient | None = None) -> str:
+    """Extract the key factual answer from retrieved evidence (no LLM call needed).
+
+    Uses the first substantive sentence of the evidence as the extracted answer.
+    The actual conflict detection relies on NLI(evidence, parametric_answer), not
+    on this extracted string — this is primarily for logging.
+    """
+    if not evidence:
+        return ""
+    # Return first sentence up to 200 chars
+    first_sent = evidence.split(".")[0].strip()
+    return first_sent[:200] if first_sent else evidence[:200]
 
 
 class ParametricProbe:
     def __init__(self, llm_client: LLMClient):
         self.llm = llm_client
+        self.lm_call_count: dict[str, int] = {}
 
     def probe(self, sub_question: str) -> ParametricMemory:
         """Answer sub_question using only parametric knowledge (no retrieval context)."""
+        self.lm_call_count["parametric_probe"] = self.lm_call_count.get("parametric_probe", 0) + 1
         try:
             resp = self.llm.generate(
                 _PROBE_PROMPT.format(sub_question=sub_question),
@@ -94,7 +96,7 @@ class ParametricProbe:
         A conflict is "real" only when the model is certain (confidence < threshold).
         trust_retrieved = GCS × 𝟙[conflict]
         """
-        retrieved_answer = _extract_answer_from_evidence(retrieved_evidence, llm_client)
+        retrieved_answer = _extract_answer_from_evidence(retrieved_evidence)
 
         if not parametric.answer:
             return ConflictResult(
