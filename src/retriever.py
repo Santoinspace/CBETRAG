@@ -1,6 +1,9 @@
-"""Retriever abstraction layer — wraps AdaRAGUE's ElasticSearch index."""
+"""Retriever abstraction layer — wraps ElasticSearch and in-memory sources."""
 from __future__ import annotations
 from abc import ABC, abstractmethod
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Retriever(ABC):
@@ -11,31 +14,35 @@ class Retriever(ABC):
 
 
 class ElasticRetriever(Retriever):
-    """Thin wrapper around AdaRAGUE's BEIR ElasticSearch index."""
+    """BM25 retrieval against an ElasticSearch Wikipedia index.
 
-    def __init__(self, index_name: str, host: str = "localhost",
+    Uses the raw elasticsearch-py client for reliability (BEIR wrapper
+    may not return full document sources across versions).
+    """
+
+    def __init__(self, index_name: str = "wiki", host: str = "localhost",
                  port: int = 9200, top_k: int = 5):
-        from beir.retrieval.search.lexical.elastic_search import ElasticSearch
-        config = {
-            "hostname": {"host": host, "port": port},
-            "index_name": index_name,
-            "keys": {"title": "title", "body": "txt"},
-            "timeout": 100,
-            "retry_on_timeout": True,
-            "maxsize": 24,
-            "number_of_shards": "default",
-            "language": "english",
-        }
-        self._es = ElasticSearch(config)
+        from elasticsearch import Elasticsearch
+        self._es = Elasticsearch([{"host": host, "port": port}])
+        self._index = index_name
         self._top_k = top_k
 
     def retrieve(self, query: str, top_k: int | None = None) -> list[str]:
         k = top_k or self._top_k
-        results = self._es.lexical_multisearch(
-            texts=[query], top_hits=k
-        )
-        hits = results[0].get("hits", {}).get("hits", [])
-        return [h["_source"].get("txt", "") for h in hits]
+        try:
+            body = {
+                "query": {
+                    "match": {"txt": query}
+                },
+                "size": k,
+                "_source": ["txt"],
+            }
+            resp = self._es.search(index=self._index, body=body)
+            hits = resp["hits"]["hits"]
+            return [h["_source"].get("txt", "") for h in hits]
+        except Exception as e:
+            logger.warning("ES retrieve failed for '%s': %s", query[:60], e)
+            return []
 
 
 class PassageListRetriever(Retriever):

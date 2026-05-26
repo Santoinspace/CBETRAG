@@ -812,6 +812,8 @@ def run(args):
 | GCS density-based refactor | ✅ 完成   | 2026-05-25 | conflict_ratio > threshold (0.35) 替代 boolean contradiction；新增 CompletenessResult 遥测字段；18+9 tests pass            |
 | ES 状态检查                | ✅ 完成   | 2026-05-25 | ES 未运行；Docker 可用；Wikipedia TSV 未下载 (需 ~14GB 压缩, ~32GB 解压)；可用磁盘 56GB                              |
 | BM25 mini 索引             | ✅ 完成   | 2026-05-25 | 4928 passages, 2.6 MB, <10ms/query；rank-bm25 已安装；src/bm25_retriever.py 就绪                                         |
+| BM25 迭代检索实验          | ⚠️ 未通过 | 2026-05-26 | 2/4 checks: CBET>SingleRAG ✓, Gold@3>Gold@1 ✓; EarlyStop 0%, CS rising 0/20 ✗; CS 恒为 0 因 BM25 检索证据覆盖度低       |
+| ES 全量检索验证            | ✅ 完成   | 2026-05-26 | ES wiki 索引 (21M passages) 就绪；Coverage 恢复正常 (0.98-0.99)；CS 瓶颈从 Coverage 转为 min_cov + GCS；CBET F1 20.0 vs SingleRAG 34.7 |
 | CBET 完整实验              | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
 | 消融实验                   | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
 | θ 敏感性分析              | ⬜ 未开始 | -          | -                                                                                                                                                  |
@@ -853,7 +855,9 @@ def run(args):
 - [2026-05-25] NLI Coverage 方向第二次修正 → NLI(claim→answer) 前提蕴含假设 → DeBERTa 设计场景，语义正确；但修复后 CS 仍趋近 0 → 诊断发现根因是 3B 模型 claim extraction 输出非 JSON 格式
 - [2026-05-25] Claim extraction 重写 → 新 prompt (纯文本 3-5 条) + robust parser (4 strategies: JSON recovery→编号列表→项目符号→句分割) + claim filtering；Cov 恢复到 0.99，claims 数量 4-8；parser 对 3B 编号列表输出稳定
 - [2026-05-25] GCS blocker 定位 → Cov 已修复但 CS 仍为 0 → 根因：布尔 GCS 在混合证据场景恒 0
-- [2026-05-25] GCS density-based refactor → conflict_ratio = n_contra / (len(claims_i) × len(claims_j)) > threshold (0.35) → 替代 boolean 检查；新增 CompletenessResult 字段 (avg_conflict_ratio, max_conflict_ratio, contradicting_branch_pairs, valid_branch_pairs)；CBETConfig.gcs_conflict_threshold=0.35；NLIScorer 构造函数接受此参数；18/18 NLI + 9/9 e2e tests pass；GCS 从恒 0 恢复到有意义分布 (mean=0.6)
+- [2026-05-25] GCS density-based refactor → conflict_ratio > threshold (0.35) 替代 boolean check；18+9 tests pass
+- [2026-05-26] BM25 迭代检索验证 → 2/4 通过; CS 恒为 0 因 BM25 检索范围有限
+- [2026-05-26] ES 全量检索验证 → 21M passages wiki 索引就绪；ElasticRetriever 改用 raw elasticsearch-py；Coverage 恢复正常 (0.98-0.99)；证伪了"ES 修复 CS"的假设 — Coverage 虽高但 CS 瓶颈变为 min_cov (多跳子问题检索不均) + GCS (跨 branch 矛盾)。3B 模型下 CBET F1=20.0 未超过 SingleRAG F1=34.7；需 7B 模型提升子问题回答准确性
 - [2026-05-25] Wikipedia 索引策略 → BM25 mini 索引替代 → 峰值磁盘 71GB 超出可用 56GB；数据集内 BM25 (4928 passages, 2.6 MB) 可验证迭代检索机制，不同 query 返回不同排序结果
 
 ---
@@ -866,5 +870,5 @@ def run(args):
 - **风险 4**：DAG 提取质量依赖 Qwen2.5-7B 的 instruction following 能力，4-hop+ 问题可能产生不合理分解。**缓解**：设置 `max_branches=6`，超出时合并。
 - **风险 5**：`compute_gcs` 的两两 NLI 调用量为 O(n²)，分支数 6 时需 15 次调用。**缓解**：DeBERTa batch_size=16，批量推理约 0.3s/batch on 4060，可接受。
 - **风险 6（CS 标定 — 已解决）**：CS 通过 NLI 方向反转修复，纯 NLI CS 均值 0.099, 范围 0.0-0.941。θ=0.50 标定完成 (HotpotQA30)。CS 偏低问题已解决；θ 在 7B 模型下可能需要微调。
-- **风险 7（ES 关键阻塞）**：ES Wikipedia 索引未建立。
+- **风险 7（ES 关键阻塞 — 已解决）**：ES Docker 容器运行正常，wiki 索引已建立 (21M passages, 11.2GB)。ElasticRetriever 已切换到 raw elasticsearch-py 客户端。
 - **风险 8（GCS 混合证据阻塞 — 已解决）**：GCS 现在使用 density-based threshold（conflict_ratio > 0.35），不再因单对矛盾 claim 归零。遥测字段（avg/max_conflict_ratio, pair counts）已加入 CompletenessResult 和 JSON log。gcs_conflict_threshold=0.35 为 3B+DatasetRetriever 场景校准值。

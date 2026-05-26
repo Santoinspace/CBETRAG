@@ -23,7 +23,11 @@
       "Bash(uv run *)",
       "Bash(uv add *)",
       "Bash(curl -s http://localhost:9200/_cluster/health)",
-      "Bash(docker --version)"
+      "Bash(docker --version)",
+      "Bash(curl -s http://localhost:9200/)",
+      "Bash(curl -s http://localhost:9200/_cat/indices?v)",
+      "Bash(docker run *)",
+      "Bash(curl -s -X GET \"http://localhost:9200/wiki/_search?pretty\" -H 'Content-Type: application/json' -d '{\"query\":{\"match\":{\"txt\":\"Inception film director\"}},\"size\":2,\"_source\":[\"txt\",\"title\"]}')"
     ]
   }
 }
