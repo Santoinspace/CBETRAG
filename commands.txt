@@ -13,3 +13,20 @@ docker run ^
   --max-num-seqs 2 ^
   --dtype half ^
   --enforce-eager
+
+docker run ^
+  --name qwen7bAWQ-vllm ^
+  --gpus all ^
+  -p 8001:8001 ^
+  -v E:\Apostgraduate\projection\AAAI_Agent_RAG\CBETRAG\pretrainedModels\Qwen2.5-7B-Instruct-AWQ:/models/qwen ^
+  --ipc=host ^
+  -e VLLM_USE_V1=0 ^
+  -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 ^
+  vllm/vllm-openai:latest ^
+  --model /models/qwen ^
+  --quantization awq_marlin ^
+  --max-model-len 1024 ^
+  --gpu-memory-utilization 0.90 ^
+  --max-num-seqs 1 ^
+  --dtype half ^
+  --enforce-eager

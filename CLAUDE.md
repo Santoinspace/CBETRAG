@@ -814,9 +814,12 @@ def run(args):
 | BM25 mini 索引             | ✅ 完成   | 2026-05-25 | 4928 passages, 2.6 MB, <10ms/query；rank-bm25 已安装；src/bm25_retriever.py 就绪                                         |
 | BM25 迭代检索实验          | ⚠️ 未通过 | 2026-05-26 | 2/4 checks: CBET>SingleRAG ✓, Gold@3>Gold@1 ✓; EarlyStop 0%, CS rising 0/20 ✗; CS 恒为 0 因 BM25 检索证据覆盖度低       |
 | ES 全量检索验证            | ✅ 完成   | 2026-05-26 | ES wiki 索引 (21M passages) 就绪；Coverage 恢复正常 (0.98-0.99)；CS 瓶颈从 Coverage 转为 min_cov + GCS；CBET F1 20.0 vs SingleRAG 34.7 |
-| CBET 完整实验              | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
-| 消融实验                   | ⬜ 未开始 | -          | 需 7B 模型 + ES                                                                                                                                   |
-| θ 敏感性分析              | ⬜ 未开始 | -          | -                                                                                                                                                  |
+| 7B 模型验证                 | ✅ 完成   | 2026-05-26 | HotpotQA20: SingleRAG F1=57.5, CBET F1=69.4 (+11.9), DAG 2-3 节点合理; vLLM model id = qwen25-7b        |
+| 实验脚本套件               | ✅ 完成   | 2026-05-26 | run_exp1_main/exp2_ablation/exp3_theta/exp4_es.py + RUNNING_EXPERIMENTS.md; 全部支持 interrupt/resume    |
+| Exp1: 主对比实验           | ⬜ 未开始 | -          | HotpotQA500 + MuSiQue500, 4 方法, 3-5h                                                                 |
+| Exp2: 消融实验             | ⬜ 未开始 | -          | HotpotQA200 × 5 variants, 2-3h                                                                        |
+| Exp3: θ 敏感性            | ⬜ 未开始 | -          | HotpotQA100 × 7 θ 值, 1h                                                                               |
+| Exp4: ES 开放域           | ⬜ 未开始 | -          | HotpotQA200 + ElasticRetriever, 2-3h                                                                   |
 
 ---
 
@@ -859,6 +862,8 @@ def run(args):
 - [2026-05-26] BM25 迭代检索验证 → 2/4 通过; CS 恒为 0 因 BM25 检索范围有限
 - [2026-05-26] ES 全量检索验证 → 21M passages wiki 索引就绪；ElasticRetriever 改用 raw elasticsearch-py；Coverage 恢复正常 (0.98-0.99)；证伪了"ES 修复 CS"的假设 — Coverage 虽高但 CS 瓶颈变为 min_cov (多跳子问题检索不均) + GCS (跨 branch 矛盾)。3B 模型下 CBET F1=20.0 未超过 SingleRAG F1=34.7；需 7B 模型提升子问题回答准确性
 - [2026-05-25] Wikipedia 索引策略 → BM25 mini 索引替代 → 峰值磁盘 71GB 超出可用 56GB；数据集内 BM25 (4928 passages, 2.6 MB) 可验证迭代检索机制，不同 query 返回不同排序结果
+- [2026-05-26] 实验执行方式 → 独立 Python 脚本，手动运行 → 相比 shell 脚本调用 CLI，独立脚本支持 interrupt/resume（加载已有 JSON 跳过已处理 qid）、可观测性更强（实时打印进度）、单脚本单职责便于排查问题；4 个实验脚本对应论文 4 类结果（主对比/消融/θ敏感性/开放域）
+- [2026-05-26] 7B 模型切换 → vLLM model id 从 `/models/qwen` (3B) 切换为 `qwen25-7b` (7B-Instruct, /root/autodl-tmp/Qwen2.5-7B-Instruct)；configs/cbet_7b.yaml 已更新；验证实验 20 样本显示 CBET F1=69.4 显著超过 SingleRAG F1=57.4，方法有效性确认
 
 ---
 
@@ -872,3 +877,20 @@ def run(args):
 - **风险 6（CS 标定 — 已解决）**：CS 通过 NLI 方向反转修复，纯 NLI CS 均值 0.099, 范围 0.0-0.941。θ=0.50 标定完成 (HotpotQA30)。CS 偏低问题已解决；θ 在 7B 模型下可能需要微调。
 - **风险 7（ES 关键阻塞 — 已解决）**：ES Docker 容器运行正常，wiki 索引已建立 (21M passages, 11.2GB)。ElasticRetriever 已切换到 raw elasticsearch-py 客户端。
 - **风险 8（GCS 混合证据阻塞 — 已解决）**：GCS 现在使用 density-based threshold（conflict_ratio > 0.35），不再因单对矛盾 claim 归零。遥测字段（avg/max_conflict_ratio, pair counts）已加入 CompletenessResult 和 JSON log。gcs_conflict_threshold=0.35 为 3B+DatasetRetriever 场景校准值。
+
+---
+
+## EXPERIMENT EXECUTION CHECKLIST
+
+> 手动按顺序运行以下脚本，每个脚本均支持中断/恢复。详见 `experiments/RUNNING_EXPERIMENTS.md`。
+
+```
+[ ] 1. Exp1: uv run python experiments/run_exp1_main.py --datasets hotpotqa musique --n_samples 500 (3-5h)
+[ ] 2. Exp2: uv run python experiments/run_exp2_ablation.py --n_samples 200 (2-3h)
+[ ] 3. Exp3: uv run python experiments/run_exp3_theta.py --n_samples 100 (1h)
+[ ] 4. Exp4: uv run python experiments/run_exp4_es.py --n_samples 200 (2-3h)
+[ ] 5. python analysis/sensitivity_theta.py  (生成 Figure 2)
+[ ] 6. 更新 CLAUDE.md PROJECT STATE 中各 Exp 行状态与最终指标
+[ ] 7. 准备论文 Table 1 (主对比), Table 2 (消融), Figure 2 (θ 敏感性)
+```
+

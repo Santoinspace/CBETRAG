@@ -6,7 +6,7 @@ model_path: ./models/Qwen2.5-7B-Instruct-AWQ
 nli_model_path: ./models/nli-deberta-v3-base
 backend: vllm
 vllm_base_url: http://localhost:8000/v1
-vllm_model: /models/qwen
+vllm_model: qwen25-7b
 dataset: hotpotqa
 data_path: ./AdaRAGUE/data/adaptive_rag_hotpotqa/test.csv
 theta: 0.50

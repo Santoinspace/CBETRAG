@@ -44,7 +44,7 @@ multidict==6.7.1
 multiprocess==0.70.19
 mypy-extensions==1.1.0
 networkx==3.6.1
-numpy==2.4.6
+numpy==1.26.4
 openai==2.38.0
 packaging==26.2
 pandas==3.0.3
