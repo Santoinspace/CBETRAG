@@ -820,6 +820,9 @@ def run(args):
 | Exp2: 消融实验             | ⬜ 未开始 | -          | HotpotQA200 × 5 variants, 2-3h                                                                        |
 | Exp3: θ 敏感性            | ⬜ 未开始 | -          | HotpotQA100 × 7 θ 值, 1h                                                                               |
 | Exp4: ES 开放域           | ⬜ 未开始 | -          | HotpotQA200 + ElasticRetriever, 2-3h                                                                   |
+| DeBERTa truncation fix   | ✅ 完成   | 2026-05-28 | 所有 tokenizer 调用加 truncation=True, max_length=512; 5 次长文本 score_pair 无警告                     |
+| GCS → Edge Support       | ✅ 完成   | 2026-05-28 | DAG 边支撑验证替代跨分支矛盾; CS 均值=0.341, CS=0→0/50, EarlyStop%=34%; 14+9 tests pass                |
+| 50 条验证               | ⚠️ 部分   | 2026-05-28 | CS=0=0/50 ✅, EarlyStop=34% ✅; CBET F1=67.4 ≈ SingleRAG 67.8 (差 0.4) ⚠️; 无截断警告 ✅              |
 
 ---
 
@@ -864,13 +867,14 @@ def run(args):
 - [2026-05-25] Wikipedia 索引策略 → BM25 mini 索引替代 → 峰值磁盘 71GB 超出可用 56GB；数据集内 BM25 (4928 passages, 2.6 MB) 可验证迭代检索机制，不同 query 返回不同排序结果
 - [2026-05-26] 实验执行方式 → 独立 Python 脚本，手动运行 → 相比 shell 脚本调用 CLI，独立脚本支持 interrupt/resume（加载已有 JSON 跳过已处理 qid）、可观测性更强（实时打印进度）、单脚本单职责便于排查问题；4 个实验脚本对应论文 4 类结果（主对比/消融/θ敏感性/开放域）
 - [2026-05-26] 7B 模型切换 → vLLM model id 从 `/models/qwen` (3B) 切换为 `qwen25-7b` (7B-Instruct, /root/autodl-tmp/Qwen2.5-7B-Instruct)；configs/cbet_7b.yaml 已更新；验证实验 20 样本显示 CBET F1=69.4 显著超过 SingleRAG F1=57.4，方法有效性确认
+- [2026-05-28] DeBERTa truncation → 加 truncation=True, max_length=512 → 长文档 NLI 静默截断导致 contradiction 检测随机化，是真实精度 bug
+- [2026-05-28] GCS 理论升级 → Edge Support Verification 替代 Cross-Branch Non-Contradiction → 旧方法：NLI(长证据, 长证据) → neutral → GCS≈0（独立子问题证据在 NLI 眼里天然 neutral，且超 512 截断）→ 新方法：compute_coverage(下游证据, 上游答案) 验证桥接实体（Bridge Entity）是否在推理链中成功传递 → 理论依据：多跳推理完备性 = 推理链所有节点间的桥接实体连通性 → 工程优势：短答案(1-5词) vs 长证据，彻底规避 512 截断问题 → 论文定位升级为："DAG-guided Multi-Branch Retrieval with Dependency-Aware Epistemic Convergence Estimation"
 
 ---
 
 ## KNOWN ISSUES & RISKS
 
 - **风险 1（硬件 OOM）**：4060 8GB 显存紧张，同时运行 AWQ 主模型 + DeBERTa + KV cache 时可能触发 OOM。**缓解**：设置 `max_new_tokens=512`；如仍 OOM，将 DeBERTa 移至 CPU（`device="cpu"`），推理变慢但稳定。
-- **风险 2（AWQ logprobs 偏差）**：AWQ 量化的 logprobs 与全精度有微小差异（约 ±0.02 entropy），影响参数化记忆探测阈值标定。**缓解**：在验证集上重新标定 `tau`，不沿用全精度默认值。
 - **风险 3（推理速度）**：4060 推理速度约为 3090 的 40-50%，500 条完整实验预计 20-30 小时。**缓解**：先用 50 条验证方法有效，再挂机跑完整实验。
 - **风险 4**：DAG 提取质量依赖 Qwen2.5-7B 的 instruction following 能力，4-hop+ 问题可能产生不合理分解。**缓解**：设置 `max_branches=6`，超出时合并。
 - **风险 5**：`compute_gcs` 的两两 NLI 调用量为 O(n²)，分支数 6 时需 15 次调用。**缓解**：DeBERTa batch_size=16，批量推理约 0.3s/batch on 4060，可接受。

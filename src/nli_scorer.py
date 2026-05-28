@@ -51,6 +51,8 @@ class CompletenessResult:
     max_conflict_ratio: float = 0.0
     contradicting_branch_pairs: int = 0
     valid_branch_pairs: int = 0
+    edge_scores: list[float] = field(default_factory=list)
+    gcs_method: str = "edge_support"
 
 
 class NLIScorer:
@@ -80,7 +82,12 @@ class NLIScorer:
 
     def _truncate(self, text: str, max_tokens: int = 256) -> str:
         """Keep first+last 128 tokens when text exceeds DeBERTa's 512-token limit."""
-        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        ids = self.tokenizer.encode(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=512,
+        )
         if len(ids) <= max_tokens:
             return text
         half = max_tokens // 2
@@ -378,6 +385,49 @@ class NLIScorer:
             logger.warning("compute_gcs failed: %s", e)
             return 1.0
 
+    # ── edge support GCS ─────────────────────────────────────────────────────
+
+    def _compute_edge_support_gcs(
+        self,
+        branch_evidences: list[str],
+        branch_answers: list[str],
+        dependency_pairs: list[tuple[int, int]],
+        llm_client: LLMClient | None,
+    ) -> tuple[float, list[float]]:
+        """Edge Support Verification GCS.
+
+        For each DAG dependency edge (src→tgt), verify that the downstream
+        evidence supports the upstream answer (bridge entity propagation).
+
+        Uses compute_coverage(tgt_evidence, src_answer) — short answer vs
+        long evidence, avoiding 512-token truncation entirely.
+
+        Returns:
+            gcs: mean of all edge scores (1.0 if no edges)
+            edge_scores: per-edge scores for logging
+        """
+        if not dependency_pairs:
+            return 1.0, []
+
+        edge_scores: list[float] = []
+        for src_idx, tgt_idx in dependency_pairs:
+            src_answer = branch_answers[src_idx] if src_idx < len(branch_answers) else ""
+            tgt_evidence = branch_evidences[tgt_idx] if tgt_idx < len(branch_evidences) else ""
+
+            if not src_answer or not tgt_evidence:
+                edge_scores.append(0.0)
+                continue
+
+            try:
+                score = self.compute_coverage(tgt_evidence, src_answer, llm_client)
+            except Exception as e:
+                logger.warning("edge support score failed for (%d→%d): %s", src_idx, tgt_idx, e)
+                score = 0.0
+            edge_scores.append(score)
+
+        gcs = sum(edge_scores) / len(edge_scores) if edge_scores else 1.0
+        return gcs, edge_scores
+
     def compute_completeness_score(
         self,
         branch_evidences: list[str],
@@ -385,18 +435,19 @@ class NLIScorer:
         sub_questions: list[str],
         llm_client: LLMClient,
         skip_gcs: bool = False,
+        dependency_pairs: list[tuple[int, int]] | None = None,
     ) -> CompletenessResult:
         """CS = min_i(Cov_i) × GCS.  Identifies noisy (contradictory) branches.
 
-        When skip_gcs=True (no_cross_branch ablation), GCS is forced to 1.0
-        and noisy branch detection is skipped.
+        GCS is computed via Edge Support Verification: for each DAG dependency
+        edge (src→tgt), check if downstream evidence supports the upstream
+        answer (bridge entity propagation).
 
-        Claims are extracted once per evidence and reused across coverage,
-        GCS, and noisy-branch detection.
+        When skip_gcs=True (no_cross_branch ablation), GCS is forced to 1.0.
         """
         n = len(branch_evidences)
 
-        # Extract atomic claims ONCE per evidence (was 3x before: coverage + gcs + noisy)
+        # Extract atomic claims ONCE per evidence (reused for coverage)
         all_claims: list[list[str]] = []
         for i in range(n):
             if branch_evidences[i]:
@@ -408,8 +459,7 @@ class NLIScorer:
                 claims = []
             all_claims.append(claims)
 
-        # Per-branch coverage — NLI(answer → claim): short→short, DeBERTa's design scenario.
-        # A high entailment means the answer is consistent with at least one evidence claim.
+        # Per-branch coverage — NLI(claim → answer): does evidence entail the answer?
         coverages: list[float] = []
         for i in range(n):
             if not branch_answers[i] or not all_claims[i]:
@@ -425,59 +475,32 @@ class NLIScorer:
                 coverages.append(0.0)
         min_cov = min(coverages) if coverages else 0.0
 
-        # GCS — density-based thresholding, reuse cached claims
-        gcs_telemetry = {"avg_conflict_ratio": 0.0, "max_conflict_ratio": 0.0,
-                         "contradicting_branch_pairs": 0, "valid_branch_pairs": 0}
+        # GCS — Edge Support Verification
+        edge_scores: list[float] = []
+        gcs_method = "edge_support"
         if skip_gcs or n <= 1:
             gcs = 1.0
+            gcs_method = "skip" if skip_gcs else "single_branch"
         else:
-            try:
-                conflict_ratios: list[float] = []
-                contradicting = 0
-                valid = 0
-                for i, j in combinations(range(n), 2):
-                    claims_i, claims_j = all_claims[i], all_claims[j]
-                    total_pairs = len(claims_i) * len(claims_j)
-                    if total_pairs == 0:
-                        continue
-                    valid += 1
-                    cross_pairs = [(ci, cj) for ci in claims_i for cj in claims_j]
-                    results = self._batch_score(cross_pairs)
-                    n_contra = sum(1 for r in results if r.label == "contradiction")
-                    conflict_ratio = n_contra / total_pairs
-                    conflict_ratios.append(conflict_ratio)
-                    if conflict_ratio > self.gcs_conflict_threshold:
-                        contradicting += 1
-                gcs = 1.0 - contradicting / valid if valid else 1.0
-                if conflict_ratios:
-                    gcs_telemetry = {
-                        "avg_conflict_ratio": sum(conflict_ratios) / len(conflict_ratios),
-                        "max_conflict_ratio": max(conflict_ratios),
-                        "contradicting_branch_pairs": contradicting,
-                        "valid_branch_pairs": valid,
-                    }
-            except Exception as e:
-                logger.warning("compute_gcs failed: %s", e)
-                gcs = 1.0
+            gcs, edge_scores = self._compute_edge_support_gcs(
+                branch_evidences, branch_answers,
+                dependency_pairs or [], llm_client,
+            )
+            if not dependency_pairs:
+                gcs_method = "no_edges"
+
         cs = min_cov * gcs
 
-        # Noisy branch detection — density-based, reuse cached claims
+        # Noisy branch detection — branches involved in low-support edges
         noisy: set[int] = set()
-        if n > 1 and not skip_gcs:
-            try:
-                for i, j in combinations(range(n), 2):
-                    claims_i, claims_j = all_claims[i], all_claims[j]
-                    total_pairs = len(claims_i) * len(claims_j)
-                    if total_pairs == 0:
-                        continue
-                    cross = [(ci, cj) for ci in claims_i for cj in claims_j]
-                    results = self._batch_score(cross)
-                    n_contra = sum(1 for r in results if r.label == "contradiction")
-                    conflict_ratio = n_contra / total_pairs
-                    if conflict_ratio > self.gcs_conflict_threshold:
-                        noisy.add(i if coverages[i] <= coverages[j] else j)
-            except Exception as e:
-                logger.warning("noisy branch detection failed: %s", e)
+        if edge_scores and dependency_pairs:
+            for idx, (src_idx, tgt_idx) in enumerate(dependency_pairs):
+                if idx < len(edge_scores) and edge_scores[idx] < 0.2:
+                    # Mark the branch with lower coverage as noisy
+                    if coverages[src_idx] <= coverages[tgt_idx]:
+                        noisy.add(src_idx)
+                    else:
+                        noisy.add(tgt_idx)
 
         return CompletenessResult(
             branch_coverages=coverages,
@@ -486,8 +509,6 @@ class NLIScorer:
             cs=cs,
             should_stop=cs >= self.theta,
             noisy_branch_ids=sorted(noisy),
-            avg_conflict_ratio=gcs_telemetry["avg_conflict_ratio"],
-            max_conflict_ratio=gcs_telemetry["max_conflict_ratio"],
-            contradicting_branch_pairs=gcs_telemetry["contradicting_branch_pairs"],
-            valid_branch_pairs=gcs_telemetry["valid_branch_pairs"],
+            edge_scores=edge_scores,
+            gcs_method=gcs_method,
         )

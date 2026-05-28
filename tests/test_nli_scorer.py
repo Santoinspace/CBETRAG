@@ -209,20 +209,22 @@ def test_completeness_should_not_stop_when_cs_low():
 
 
 def test_noisy_branch_marked_lower_coverage():
-    """When cross-claim conflict_ratio > threshold, lower-coverage branch marked noisy."""
-    pair_call = []
+    """When edge support score < 0.2, lower-coverage branch marked noisy."""
+    call_count = [0]
 
     def mixed_scores(pairs):
-        pair_call.append(len(pairs))
-        # First call is coverage (claim→answer), second is noisy detection (cross-claims)
-        if len(pair_call) <= 2:
-            # Coverage: return entailment (high for first branch)
-            if len(pair_call) == 1:
-                return [NLIResult("entailment", 0.2, 0.1, 0.7) for _ in pairs]
-            else:
-                return [NLIResult("entailment", 0.9, 0.05, 0.05) for _ in pairs]
-        # Noisy detection: return all contradictions → conflict_ratio=1.0 > 0.35
-        return [NLIResult("contradiction", 0.05, 0.05, 0.9) for _ in pairs]
+        call_count[0] += 1
+        # Odd calls: coverage (branch 0 gets low entailment, branch 1 gets high)
+        # Even calls: edge support (low score → noisy)
+        if call_count[0] == 1:
+            # Coverage for branch 0: low entailment
+            return [NLIResult("entailment", 0.2, 0.1, 0.7) for _ in pairs]
+        elif call_count[0] == 2:
+            # Coverage for branch 1: high entailment
+            return [NLIResult("entailment", 0.9, 0.05, 0.05) for _ in pairs]
+        else:
+            # Edge support: low entailment → edge_score < 0.2 → noisy
+            return [NLIResult("neutral", 0.05, 0.9, 0.05) for _ in pairs]
 
     scorer = _scorer_with_logits(mixed_scores)
     scorer.theta = 0.75
@@ -233,6 +235,7 @@ def test_noisy_branch_marked_lower_coverage():
         branch_answers=["ans1", "ans2"],
         sub_questions=["q1", "q2"],
         llm_client=llm,
+        dependency_pairs=[(0, 1)],  # edge from branch 0 to branch 1
     )
     # Branch 0 has lower coverage (0.2 < 0.9), should be marked noisy
     assert 0 in result.noisy_branch_ids

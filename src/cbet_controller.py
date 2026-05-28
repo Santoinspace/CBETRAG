@@ -249,13 +249,22 @@ class CBETController:
                         state.current_answer = self._answer_branch(sq, state)
                         state._last_evidence_for_answer = state.evidence
 
-            # Step 6: completeness score
+            # Step 6: completeness score with DAG dependency edges
+            # Build dependency pairs: (src_idx, tgt_idx) for each DAG edge
+            sq_id_to_idx = {sq.id: idx for idx, sq in enumerate(dag.sub_questions)}
+            dependency_pairs: list[tuple[int, int]] = []
+            for tgt_idx, sq in enumerate(dag.sub_questions):
+                for dep_id in sq.depends_on:
+                    if dep_id in sq_id_to_idx:
+                        dependency_pairs.append((sq_id_to_idx[dep_id], tgt_idx))
+
             cs_result = self.nli_scorer.compute_completeness_score(
                 branch_evidences=[branch_states[sq.id].evidence for sq in dag.sub_questions],
                 branch_answers=[branch_states[sq.id].current_answer for sq in dag.sub_questions],
                 sub_questions=[sq.text for sq in dag.sub_questions],
                 llm_client=self.llm,
                 skip_gcs=self.config.skip_cross_branch_nli,
+                dependency_pairs=dependency_pairs,
             )
 
             # Step 7: stop if complete
@@ -298,10 +307,8 @@ class CBETController:
             "branch_cs_scores": cs_result.branch_coverages if cs_result else [],
             "final_cs": cs_result.cs if cs_result else 0.0,
             "gcs": cs_result.gcs if cs_result else 0.0,
-            "avg_conflict_ratio": cs_result.avg_conflict_ratio if cs_result else 0.0,
-            "max_conflict_ratio": cs_result.max_conflict_ratio if cs_result else 0.0,
-            "contradicting_branch_pairs": cs_result.contradicting_branch_pairs if cs_result else 0,
-            "valid_branch_pairs": cs_result.valid_branch_pairs if cs_result else 0,
+            "gcs_method": cs_result.gcs_method if cs_result else "none",
+            "edge_scores": cs_result.edge_scores if cs_result else [],
             "conflicts_detected": conflicts_detected,
             "overrides_triggered": overrides_triggered,
             "noisy_evicted": noisy_evicted,
