@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import math
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,14 @@ class LLMClient(ABC):
 
     def generate(self, prompt: str, max_new_tokens: int = 512,
                  temperature: float = 0.0, use_cache: bool = True) -> LLMResponse:
-        """Generate with disk cache. Pass use_cache=False for non-deterministic calls."""
+        """Generate with disk cache + retry on empty response.
+
+        Retries up to 3 times with exponential backoff (1s, 2s, 4s) when
+        the LLM returns an empty response (e.g. vLLM concurrent timeout).
+        Empty responses are never cached.
+        """
         if not use_cache:
-            return self._generate(prompt, max_new_tokens, temperature)
+            return self._generate_with_retry(prompt, max_new_tokens, temperature)
 
         key = self._cache_key(prompt, max_new_tokens, temperature)
         cache_file = self.cache_dir / f"{key}.json"
@@ -56,16 +62,26 @@ class LLMClient(ABC):
             self._cache_hits += 1
             try:
                 data = json.loads(cache_file.read_text(encoding='utf-8'))
-                return LLMResponse(
-                    text=data["text"],
-                    logprobs=data.get("logprobs", [])
-                )
+                text = data.get("text", "")
+                # Skip cached empty responses — they are stale/invalid
+                if text and text.strip():
+                    return LLMResponse(
+                        text=text,
+                        logprobs=data.get("logprobs", [])
+                    )
+                # Empty cached entry — fall through to retry
+                logger.debug("skipping cached empty response for key %s", key[:16])
             except Exception:
                 # Corrupted cache entry — fall through to actual call
                 pass
 
         self._cache_misses += 1
-        response = self._generate(prompt, max_new_tokens, temperature)
+        response = self._generate_with_retry(prompt, max_new_tokens, temperature)
+
+        # Never cache empty responses
+        if not response.text.strip():
+            logger.warning("LLM returned empty response, not caching (key=%s)", key[:16])
+            return response
 
         try:
             cache_file.write_text(
@@ -80,6 +96,34 @@ class LLMClient(ABC):
             logger.debug("cache write failed: %s", e)
 
         return response
+
+    def _generate_with_retry(self, prompt: str, max_new_tokens: int = 512,
+                             temperature: float = 0.0,
+                             max_retries: int = 3) -> LLMResponse:
+        """Call _generate with exponential backoff retry on empty response."""
+        last_response = LLMResponse(text="", logprobs=[])
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._generate(prompt, max_new_tokens, temperature)
+            except Exception as e:
+                logger.warning("LLM call failed (attempt %d/%d): %s",
+                               attempt + 1, max_retries + 1, e)
+                response = LLMResponse(text="", logprobs=[])
+
+            if response.text.strip():
+                if attempt > 0:
+                    logger.info("LLM call succeeded on retry %d", attempt + 1)
+                return response
+
+            last_response = response
+            if attempt < max_retries:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning("LLM returned empty response (attempt %d/%d), "
+                               "retrying in %ds...", attempt + 1, max_retries + 1, wait)
+                time.sleep(wait)
+
+        logger.error("LLM returned empty response after %d attempts", max_retries + 1)
+        return last_response
 
     @abstractmethod
     def _generate(self, prompt: str, max_new_tokens: int = 512,

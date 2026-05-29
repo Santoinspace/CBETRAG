@@ -839,7 +839,9 @@ def run(args):
 | LLM 缓存 key 加固          | ✅ 完成     | 2026-05-29 | model_name 加入 MD5 key；AWQ/HF/VLLMClient 均设置 self.model_name；防跨模型缓存污染                                                    |
 | DAG 遥测字段               | ✅ 完成     | 2026-05-29 | dag_success/dag_fallback/dag_branches/dag_hop_count 加入 exp1/exp2 返回 dict；evaluate_all.py aggregate() 新增 DAG 列；failure_mode 新增 Type C |
 | vLLM 模型一致性检查        | ✅ 完成     | 2026-05-29 | run_exp1_main.py 新增 check_model_consistency()；启动前 models.list() 验证，不匹配 sys.exit(1)                                        |
-| Exp1 全量 500 条           | ⬜ 待执行   | -          | hotpotqa 0/500 待启动（重跑），musique 0/500 待启动；预计 ~0.6h                                                                        |
+| LLM 空响应重试             | ✅ 完成     | 2026-05-29 | _generate_with_retry(): 3 次重试 + 指数退避；空响应不缓存；已有空缓存自动跳过；76 tests pass                                             |
+| check_exp1_quality.py      | ✅ 完成     | 2026-05-29 | 受损判定=空答案（非低CS）；3 qid受损(全MuSiQue)，20条空缓存；--fix模式删除+清理；续跑自动补全                                            |
+| Exp1 全量 500 条           | ⚠️ 补跑中  | -          | 497/500 hotpotqa ✅，497/500 musique ✅；3 qid 受损待 --fix + workers=2 补跑                                                            |
 | Exp2 消融 200 条           | ⬜ 待执行   | -          | 5 variants x 200 samples；预计 ~0.6h                                                                                                   |
 | Exp3 θ 敏感性             | ⬜ 待执行   | -          | 7 theta values x 100 samples；预计 ~0.4h                                                                                               |
 
@@ -901,6 +903,8 @@ def run(args):
 - [2026-05-29] LLM 缓存 key 加固（防跨模型污染）→ `_cache_key()` 将 model_name 加入 MD5 哈希内容 → 根因：3B 与 7B 实验共享相同 prompt 时，旧 key 仅含 temp+max_tokens+prompt，会导致 3B 缓存结果被 7B 实验命中，污染实验数据；修复后所有子类 (AWQClient/HFClient/VLLMClient) 均在 `__init__` 中设置 `self.model_name`
 - [2026-05-29] DAG 遥测字段加入结果 JSON → 新增 dag_success/dag_fallback/dag_branches/dag_hop_count → 目的：区分"CBET 正常运行"与"CBET 因 DAG 提取失败退化为 flat IterativeRAG"；run_exp1_main.py、run_exp2_ablation.py 的 run_cbet/run_variant 返回 dict 统一更新；analysis/evaluate_all.py aggregate() 新增 dag_success_rate、avg_dag_branches、dag_fallback_rate、avg_dag_hop_count；failure_mode_analysis() 新增 Type C（DAG fallback 样本对比）
 - [2026-05-29] vLLM 模型一致性检查 → run_exp1_main.py 新增 `check_model_consistency()` → 启动前通过 OpenAI models.list() API 验证 vLLM server 上的模型 ID 与 --vllm_model 参数匹配；不匹配时 sys.exit(1) 防止错误配置运行实验
+- [2026-05-29] LLM 空响应重试 + 不缓存空结果 → `_generate_with_retry()` 实现 3 次重试 + 指数退避（1s/2s/4s）；空响应不写入缓存；已有空缓存条目在 generate() 中被跳过并回退到实际调用；根因：vLLM 并发超时返回 "" 被缓存后污染后续重跑
+- [2026-05-29] 受损样本判定标准 → 空答案（answer.strip()==""）→ 而非低 CS 分数；低 CS（<0.01）是 Edge Support 的正常行为（DAG 边支撑弱 ≠ 故障）；check_exp1_quality.py 仅标记空答案 qid 为受损，全量 1000 CBET 中仅 2 个空答案 + 3 个 qid 跨方法受损
 
 ---
 
