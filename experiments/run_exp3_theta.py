@@ -64,8 +64,8 @@ def run_cbet_theta(q: Question, llm: VLLMClient, theta: float) -> dict:
     nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="cpu",
                      theta=theta, gcs_conflict_threshold=0.35)
     probe = ParametricProbe(llm)
-    config = CBETConfig(theta=theta, tau=0.5, max_iterations=5, max_branches=6,
-                        gcs_conflict_threshold=0.35)
+    config = CBETConfig(theta=theta, tau=0.5, max_iterations=3, min_iterations=1,
+                        max_branches=6, gcs_conflict_threshold=0.35)
     controller = CBETController(llm, retriever, nli, probe, config)
     result = controller.solve(q)
     early_stopped = result.iterations < config.max_iterations and result.cs_score >= theta

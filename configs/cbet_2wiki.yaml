@@ -5,8 +5,8 @@ dataset: 2wikimultihopqa
 data_path: ./AdaRAGUE/data/adaptive_rag_2wikimultihopqa/test.csv
 theta: 0.50
 tau: 0.5
-max_iterations: 5
-min_iterations: 2
+max_iterations: 3
+min_iterations: 1
 max_branches: 6
 max_new_tokens: 512
 nli_claim_extraction: true

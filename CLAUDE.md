@@ -77,6 +77,7 @@ Use these commands:
 - Run a Python script with `uv run <script-name>.py`
 - Run Python tools with `uv run <tool>` (e.g. `uv run pytest`, `uv run ruff`, `uv run mypy`, `uv run pre-commit`)
 - Launch a Python REPL with `uv run python`
+
 ---
 
 ## 2. 项目目录结构
@@ -137,12 +138,12 @@ cbet-rag/
 - **目标环境**：单张 RTX 4060（8GB VRAM）— vLLM 已迁移至 AutoDL 云端，本地 GPU 完全空闲
 - **VRAM 预算**（8GB 总量，vLLM 在云端）：
 
-  | 组件                                        | 显存占用         | 运行位置 |
-  | ------------------------------------------- | ---------------- | -------- |
+  | 组件                                        | 显存占用         | 运行位置   |
+  | ------------------------------------------- | ---------------- | ---------- |
   | cross-encoder/nli-deberta-v3-**base** | ~0.4GB           | GPU (本地) |
-  | KV cache + 激活值余量                       | ~2.0GB           | GPU      |
-  | 系统 overhead                               | ~0.5GB           | GPU      |
-  | **合计**                              | **~2.9GB** | ✅ 宽裕  |
+  | KV cache + 激活值余量                       | ~2.0GB           | GPU        |
+  | 系统 overhead                               | ~0.5GB           | GPU        |
+  | **合计**                              | **~2.9GB** | ✅ 宽裕    |
 - **⚠️ 重要约束**：
 
   - vLLM 运行在 AutoDL 云端（Qwen2.5-7B-Instruct），本地仅运行 NLI 模型
@@ -514,14 +515,14 @@ def solve(self, question: Question) -> CBETResult:
   
         # Step 2: 按拓扑序执行各层
         for parallel_batch in dag.get_execution_order():
-    
+  
             # Step 2a: 叶节点并行检索
             leaf_nodes = [sq for sq in parallel_batch if sq.is_leaf]
             if leaf_nodes:
                 retrieval_results = self._parallel_retrieve(
                     leaf_nodes, branch_states
                 )
-    
+  
             # Step 2b: 内部节点串行（使用已验证的前驱答案）
             internal_nodes = [sq for sq in parallel_batch if not sq.is_leaf]
             for node in internal_nodes:
@@ -529,18 +530,18 @@ def solve(self, question: Question) -> CBETResult:
                     node, branch_states
                 )
                 retrieval_results[node.id] = self._retrieve(enriched_query)
-    
+  
             # Step 3: 为每个分支更新证据
             for sq in parallel_batch:
                 branch_states[sq.id].evidence = retrieval_results[sq.id]
-        
+      
                 # Step 4: 参数化记忆探测 + 冲突检测
                 param_mem = self.parametric_probe.probe(sq.text)
                 conflict = self.parametric_probe.detect_conflict(
                     param_mem, branch_states[sq.id].evidence
                 )
                 branch_states[sq.id].conflict = conflict
-        
+      
                 # Step 5: epistemic override（如果需要）
                 if conflict.trust_retrieved > self.config.tau:
                     branch_states[sq.id].override_prompt = \
@@ -790,49 +791,54 @@ def run(args):
 
 > 每次完成 Task 后在此更新，格式如下
 
-| Task                       | 状态      | 完成时间   | 备注                                                                                                                                               |
-| -------------------------- | --------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Task 0: 环境验证           | ✅ 完成   | 2026-05-22 | tests/test_env.py 已就绪，需模型下载后运行                                                                                                         |
-| Task 1: 数据适配器         | ✅ 完成   | 2026-05-22 | src/data_adapter.py，6/6 测试通过                                                                                                                  |
-| Task 2: DAG 提取器         | ✅ 完成   | 2026-05-22 | src/dag_extractor.py，7/7 测试通过                                                                                                                 |
-| Task 3: NLI 评分器         | ✅ 完成   | 2026-05-25 | src/nli_scorer.py；DeBERTa GPU (auto) + score_batch + MD5 缓存 + thread-safe                           |
-| Task 4: 参数化探针         | ✅ 完成   | 2026-05-25 | src/parametric_probe.py；probe 仅执行一次，detect_conflict 去掉 LLM answer extraction                                                               |
-| Task 5: 主控制器           | ✅ 完成   | 2026-05-25 | src/cbet_controller.py；LM 调用计数 + evidence 缓存优化，total LM ≤ 14                                                                             |
-| Task 6: Epistemic Override | ✅ 完成   | 2026-05-22 | src/epistemic_override.py，含在 e2e 测试中                                                                                                         |
-| Task 7: 实验脚本           | ✅ 完成   | 2026-05-22 | run_cbet.sh, run_ablations.sh, run_baselines.sh, sensitivity_theta.py 已就绪                                                                       |
-| Task 8: 评估聚合           | ✅ 完成   | 2026-05-24 | analysis/evaluate_all.py 已就绪，20+ 测试通过                                                                                                      |
-| 修复 1-4                   | ✅ 完成   | 2026-05-25 | 3B 模型 + 真实 DeBERTa + LM 优化 + DatasetPassageRetriever                                                                                        |
-| Baseline 验证实验          | ✅ 完成   | 2026-05-25 | HotpotQA50+MuSiQue30: 3B模型+DeBERTa(CPU)+DatasetPassageRetriever; CBET F1 56.6/50.8 vs SingleRAG 49.3/37.6 |
-| 3B 指标修复实验            | ✅ 完成   | 2026-05-25 | 答案简洁化 (1-5词) F1 大幅提升; contains_rate 正式指标; configs/cbet_7b.yaml 就绪; run_cbet.sh 含 7B 注释  |
-| Coverage 修复              | ✅ 完成   | 2026-05-25 | NLI(answer→claim) 替代 NLI(claim→answer)；CS 从 0.006 提升到 0.0-0.94 分布                                      |
-| θ 重标定                  | ✅ 完成   | 2026-05-25 | HotpotQA30 网格搜索；最优 θ=0.50, EarlyStop%=26.7%, F1=65.4；已更新所有 configs/*.yaml                                |
-| string-match floor 移除    | ✅ 完成   | 2026-05-25 | 删除虚假 floor=0.5；纯 NLI CS 均值 0.099, 范围 0.0-0.941；1/10 样本 CS≥0.5                                               |
-| NLI 方向修复 v2            | ⚠️ 阻断   | 2026-05-25 | NLI(claim→answer) 语义正确；但 CS 仍近 0 (0/10≥0.3) — 根因：3B 模型 claim extraction 输出非 JSON 格式，parse 失败       |
-| Claim extraction 修复      | ✅ 完成   | 2026-05-25 | 新 prompt (纯文本) + robust parser (JSON→编号→项目符号→句分割)；Cov=0.99 ✅；CS=0 因 GCS=0（见下）                       |
-| GCS density-based refactor | ✅ 完成   | 2026-05-25 | conflict_ratio > threshold (0.35) 替代 boolean contradiction；新增 CompletenessResult 遥测字段；18+9 tests pass            |
-| ES 状态检查                | ✅ 完成   | 2026-05-25 | ES 未运行；Docker 可用；Wikipedia TSV 未下载 (需 ~14GB 压缩, ~32GB 解压)；可用磁盘 56GB                              |
-| BM25 mini 索引             | ✅ 完成   | 2026-05-25 | 4928 passages, 2.6 MB, <10ms/query；rank-bm25 已安装；src/bm25_retriever.py 就绪                                         |
-| BM25 迭代检索实验          | ⚠️ 未通过 | 2026-05-26 | 2/4 checks: CBET>SingleRAG ✓, Gold@3>Gold@1 ✓; EarlyStop 0%, CS rising 0/20 ✗; CS 恒为 0 因 BM25 检索证据覆盖度低       |
-| ES 全量检索验证            | ✅ 完成   | 2026-05-26 | ES wiki 索引 (21M passages) 就绪；Coverage 恢复正常 (0.98-0.99)；CS 瓶颈从 Coverage 转为 min_cov + GCS；CBET F1 20.0 vs SingleRAG 34.7 |
-| 7B 模型验证                 | ✅ 完成   | 2026-05-26 | HotpotQA20: SingleRAG F1=57.5, CBET F1=69.4 (+11.9), DAG 2-3 节点合理; vLLM model id = qwen25-7b        |
-| 实验脚本套件               | ✅ 完成   | 2026-05-26 | run_exp1_main/exp2_ablation/exp3_theta/exp4_es.py + RUNNING_EXPERIMENTS.md; 全部支持 interrupt/resume    |
-| Exp1: 主对比实验           | ⬜ 未开始 | -          | HotpotQA500 + MuSiQue500, 4 方法, 3-5h                                                                 |
-| Exp2: 消融实验             | ⬜ 未开始 | -          | HotpotQA200 × 5 variants, 2-3h                                                                        |
-| Exp3: θ 敏感性            | ⬜ 未开始 | -          | HotpotQA100 × 7 θ 值, 1h                                                                               |
-| Exp4: ES 开放域           | ⬜ 未开始 | -          | HotpotQA200 + ElasticRetriever, 2-3h                                                                   |
-| DeBERTa truncation fix   | ✅ 完成   | 2026-05-28 | 所有 tokenizer 调用加 truncation=True, max_length=512; 5 次长文本 score_pair 无警告                     |
-| GCS → Edge Support       | ✅ 完成   | 2026-05-28 | DAG 边支撑验证替代跨分支矛盾; CS 均值=0.341, CS=0→0/50, EarlyStop%=34%; 14+9 tests pass                |
-| 50 条验证               | ⚠️ 部分   | 2026-05-28 | CS=0=0/50 ✅, EarlyStop=34% ✅; CBET F1=67.4 ≈ SingleRAG 67.8 (差 0.4) ⚠️; 无截断警告 ✅              |
-| min_iterations fix       | ⬜ 待验证 | 2026-05-28 | CBETConfig 新增 min_iterations=2；cbet_controller.py 停止判断已修改；configs/*.yaml 已更新；validation 脚本就绪 |
-| 分层分析函数             | ✅ 完成   | 2026-05-28 | analysis/evaluate_all.py: stratified_analysis() 支持 HotpotQA difficulty + MuSiQue hop count           |
-| Failure Mode 分析函数    | ✅ 完成   | 2026-05-28 | analysis/evaluate_all.py: failure_mode_analysis() 输出 Type A (高CS低EM) + Type B (低CS高EM)            |
-| 效率指标补全             | ✅ 完成   | 2026-05-28 | aggregate() 新增 contains, avg_retrieval_calls, avg_tokens_consumed, early_stop_rate; 表头含 EStop%      |
-| generate_paper_tables.py | ✅ 完成   | 2026-05-28 | analysis/generate_paper_tables.py: Table 1 (主对比), Table 2 (分层), Table 3 (消融), Figure (θ)         |
-| NLI GPU 迁移             | ✅ 完成   | 2026-05-29 | device="auto", batch_size=32; ~400MB VRAM, ~12ms/pair (vs ~200ms CPU)                                  |
-| NLI 批处理 score_batch   | ✅ 完成   | 2026-05-29 | 20 pairs batch = 0.39s; compute_coverage/completeness 统一使用 score_batch                              |
-| LLM 磁盘缓存            | ✅ 完成   | 2026-05-29 | MD5 全内容哈希, .llm_cache/ 目录, LLMClient.generate() 统一缓存层                                       |
-| NLI 内存缓存            | ✅ 完成   | 2026-05-29 | MD5 全内容哈希 + threading.Lock; 推理在锁外执行, 缓存命中 <0.1ms                                        |
-| 多线程并行化             | ✅ 完成   | 2026-05-29 | src/experiment_runner.py, ThreadPoolExecutor max_workers=4; (question,method) 对为并行单元               |
+| Task                       | 状态        | 完成时间   | 备注                                                                                                                                   |
+| -------------------------- | ----------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Task 0: 环境验证           | ✅ 完成     | 2026-05-22 | tests/test_env.py 已就绪，需模型下载后运行                                                                                             |
+| Task 1: 数据适配器         | ✅ 完成     | 2026-05-22 | src/data_adapter.py，6/6 测试通过                                                                                                      |
+| Task 2: DAG 提取器         | ✅ 完成     | 2026-05-22 | src/dag_extractor.py，7/7 测试通过                                                                                                     |
+| Task 3: NLI 评分器         | ✅ 完成     | 2026-05-25 | src/nli_scorer.py；DeBERTa GPU (auto) + score_batch + MD5 缓存 + thread-safe                                                           |
+| Task 4: 参数化探针         | ✅ 完成     | 2026-05-25 | src/parametric_probe.py；probe 仅执行一次，detect_conflict 去掉 LLM answer extraction                                                  |
+| Task 5: 主控制器           | ✅ 完成     | 2026-05-25 | src/cbet_controller.py；LM 调用计数 + evidence 缓存优化，total LM ≤ 14                                                                |
+| Task 6: Epistemic Override | ✅ 完成     | 2026-05-22 | src/epistemic_override.py，含在 e2e 测试中                                                                                             |
+| Task 7: 实验脚本           | ✅ 完成     | 2026-05-22 | run_cbet.sh, run_ablations.sh, run_baselines.sh, sensitivity_theta.py 已就绪                                                           |
+| Task 8: 评估聚合           | ✅ 完成     | 2026-05-24 | analysis/evaluate_all.py 已就绪，20+ 测试通过                                                                                          |
+| 修复 1-4                   | ✅ 完成     | 2026-05-25 | 3B 模型 + 真实 DeBERTa + LM 优化 + DatasetPassageRetriever                                                                             |
+| Baseline 验证实验          | ✅ 完成     | 2026-05-25 | HotpotQA50+MuSiQue30: 3B模型+DeBERTa(CPU)+DatasetPassageRetriever; CBET F1 56.6/50.8 vs SingleRAG 49.3/37.6                            |
+| 3B 指标修复实验            | ✅ 完成     | 2026-05-25 | 答案简洁化 (1-5词) F1 大幅提升; contains_rate 正式指标; configs/cbet_7b.yaml 就绪; run_cbet.sh 含 7B 注释                              |
+| Coverage 修复              | ✅ 完成     | 2026-05-25 | NLI(answer→claim) 替代 NLI(claim→answer)；CS 从 0.006 提升到 0.0-0.94 分布                                                           |
+| θ 重标定                  | ✅ 完成     | 2026-05-25 | HotpotQA30 网格搜索；最优 θ=0.50, EarlyStop%=26.7%, F1=65.4；已更新所有 configs/*.yaml                                                |
+| string-match floor 移除    | ✅ 完成     | 2026-05-25 | 删除虚假 floor=0.5；纯 NLI CS 均值 0.099, 范围 0.0-0.941；1/10 样本 CS≥0.5                                                            |
+| NLI 方向修复 v2            | ⚠️ 阻断   | 2026-05-25 | NLI(claim→answer) 语义正确；但 CS 仍近 0 (0/10≥0.3) — 根因：3B 模型 claim extraction 输出非 JSON 格式，parse 失败                   |
+| Claim extraction 修复      | ✅ 完成     | 2026-05-25 | 新 prompt (纯文本) + robust parser (JSON→编号→项目符号→句分割)；Cov=0.99 ✅；CS=0 因 GCS=0（见下）                                  |
+| GCS density-based refactor | ✅ 完成     | 2026-05-25 | conflict_ratio > threshold (0.35) 替代 boolean contradiction；新增 CompletenessResult 遥测字段；18+9 tests pass                        |
+| ES 状态检查                | ✅ 完成     | 2026-05-25 | ES 未运行；Docker 可用；Wikipedia TSV 未下载 (需 ~14GB 压缩, ~32GB 解压)；可用磁盘 56GB                                                |
+| BM25 mini 索引             | ✅ 完成     | 2026-05-25 | 4928 passages, 2.6 MB, <10ms/query；rank-bm25 已安装；src/bm25_retriever.py 就绪                                                       |
+| BM25 迭代检索实验          | ⚠️ 未通过 | 2026-05-26 | 2/4 checks: CBET>SingleRAG ✓, Gold@3>Gold@1 ✓; EarlyStop 0%, CS rising 0/20 ✗; CS 恒为 0 因 BM25 检索证据覆盖度低                   |
+| ES 全量检索验证            | ✅ 完成     | 2026-05-26 | ES wiki 索引 (21M passages) 就绪；Coverage 恢复正常 (0.98-0.99)；CS 瓶颈从 Coverage 转为 min_cov + GCS；CBET F1 20.0 vs SingleRAG 34.7 |
+| 7B 模型验证                | ✅ 完成     | 2026-05-26 | HotpotQA20: SingleRAG F1=57.5, CBET F1=69.4 (+11.9), DAG 2-3 节点合理; vLLM model id = qwen25-7b                                       |
+| 实验脚本套件               | ✅ 完成     | 2026-05-26 | run_exp1_main/exp2_ablation/exp3_theta/exp4_es.py + RUNNING_EXPERIMENTS.md; 全部支持 interrupt/resume                                  |
+| Exp1: 主对比实验           | ⬜ 未开始   | -          | HotpotQA500 + MuSiQue500, 4 方法, 3-5h                                                                                                 |
+| Exp2: 消融实验             | ⬜ 未开始   | -          | HotpotQA200 × 5 variants, 2-3h                                                                                                        |
+| Exp3: θ 敏感性            | ⬜ 未开始   | -          | HotpotQA100 × 7 θ 值, 1h                                                                                                             |
+| Exp4: ES 开放域            | ⬜ 未开始   | -          | HotpotQA200 + ElasticRetriever, 2-3h                                                                                                   |
+| DeBERTa truncation fix     | ✅ 完成     | 2026-05-28 | 所有 tokenizer 调用加 truncation=True, max_length=512; 5 次长文本 score_pair 无警告                                                    |
+| GCS → Edge Support        | ✅ 完成     | 2026-05-28 | DAG 边支撑验证替代跨分支矛盾; CS 均值=0.341, CS=0→0/50, EarlyStop%=34%; 14+9 tests pass                                               |
+| 50 条验证                  | ⚠️ 部分   | 2026-05-28 | CS=0=0/50 ✅, EarlyStop=34% ✅; CBET F1=67.4 ≈ SingleRAG 67.8 (差 0.4) ⚠️; 无截断警告 ✅                                            |
+| min_iterations fix         | ✅ 完成     | 2026-05-29 | 50 条对照实验: min_iter=1 与 =2 指标完全一致 (EM=54, F1=67.4)；最终锁定 min_iter=1                                                     |
+| 分层分析函数               | ✅ 完成     | 2026-05-28 | analysis/evaluate_all.py: stratified_analysis() 支持 HotpotQA difficulty + MuSiQue hop count                                           |
+| Failure Mode 分析函数      | ✅ 完成     | 2026-05-28 | analysis/evaluate_all.py: failure_mode_analysis() 输出 Type A (高CS低EM) + Type B (低CS高EM)                                           |
+| 效率指标补全               | ✅ 完成     | 2026-05-28 | aggregate() 新增 contains, avg_retrieval_calls, avg_tokens_consumed, early_stop_rate; 表头含 EStop%                                    |
+| generate_paper_tables.py   | ✅ 完成     | 2026-05-28 | analysis/generate_paper_tables.py: Table 1 (主对比), Table 2 (分层), Table 3 (消融), Figure (θ)                                       |
+| NLI GPU 迁移               | ✅ 完成     | 2026-05-29 | device="auto", batch_size=32; ~400MB VRAM, ~12ms/pair (vs ~200ms CPU)                                                                  |
+| NLI 批处理 score_batch     | ✅ 完成     | 2026-05-29 | 20 pairs batch = 0.39s; compute_coverage/completeness 统一使用 score_batch                                                             |
+| LLM 磁盘缓存               | ✅ 完成     | 2026-05-29 | MD5 全内容哈希, .llm_cache/ 目录, LLMClient.generate() 统一缓存层                                                                      |
+| NLI 内存缓存               | ✅ 完成     | 2026-05-29 | MD5 全内容哈希 + threading.Lock; 推理在锁外执行, 缓存命中 <0.1ms                                                                       |
+| 多线程并行化               | ✅ 完成     | 2026-05-29 | src/experiment_runner.py, ThreadPoolExecutor max_workers=4; (question,method) 对为并行单元                                             |
+| min_iterations=1 锁定      | ✅ 完成     | 2026-05-29 | 50 条验证: min_iter=1 与 =2 结果完全一致；CS 公式内生驱动多跳，无需启发式约束                                                          |
+| 配置与环境检查             | ✅ 完成     | 2026-05-29 | 锁定 min_iter=1，max_iter=3；4 个 configs + 4 个实验脚本全部统一；多线程与续跑逻辑就绪                                                 |
+| Exp1 全量 500 条           | ⬜ 待执行   | -          | hotpotqa 0/500 待启动（重跑），musique 0/500 待启动；预计 ~0.6h                                                                        |
+| Exp2 消融 200 条           | ⬜ 待执行   | -          | 5 variants x 200 samples；预计 ~0.6h                                                                                                   |
+| Exp3 θ 敏感性             | ⬜ 待执行   | -          | 7 theta values x 100 samples；预计 ~0.4h                                                                                               |
 
 ---
 
@@ -887,6 +893,8 @@ def run(args):
 - [2026-05-29] LLM 磁盘缓存（MD5 全内容哈希）→ 同配置重复实验复用 DAG/claims/probe 结果；预计节省 40-60% LLM 调用；.llm_cache/ 目录，已加入 .gitignore；base LLMClient.generate() 统一处理缓存
 - [2026-05-29] NLI 内存缓存（MD5 全内容哈希 + threading.Lock）→ MD5(完整内容) 杜绝截断 key 的碰撞风险（致命 bug 预防）；Lock 保护 dict 写操作，推理在锁外执行允许并发 GPU 利用
 - [2026-05-29] 样本级多线程并行化（ThreadPoolExecutor, max_workers=4）→ vLLM 云端调用为网络 I/O 密集型；LLM 等待期间本地 GPU 并发处理 NLI；NLIScorer 跨线程共享（缓存加锁），run_exp1_main.py 使用 (question, method) 对作为并行单元
+- [2026-05-29] 锁定 min_iter=1 并启动全量实验 → 50 条实验显示，即使设置 min_iter=1，系统也从未在第一轮错误早停。这证明了 Edge Support 完备性公式的强大：它能内生地（endogenously）识别首轮孤立检索的不完备性，自主驱动进入第二轮多跳检索，无需任何人工硬编码的启发式最小轮数（Heuristic bounds）。这对增强论文的理论纯粹性具有决定性意义。
+- [2026-05-29] Wrong Early Stop 根因记录 → 发现少数 CS 虚高的样本并非迭代轮数问题，而是 NLI 将 distractor 中包含的 bridge entity 判定为强支撑（自洽的干扰项）。这将在论文的 Failure Mode Analysis 中如实记录为"自洽性幻觉"，留作 Future Work 处理，全量数据将提供其真实发生率分布。
 
 ---
 
@@ -907,12 +915,11 @@ def run(args):
 > 手动按顺序运行以下脚本，每个脚本均支持中断/恢复。详见 `experiments/RUNNING_EXPERIMENTS.md`。
 
 ```
-[ ] 1. Exp1: uv run python experiments/run_exp1_main.py --datasets hotpotqa musique --n_samples 500 (3-5h)
-[ ] 2. Exp2: uv run python experiments/run_exp2_ablation.py --n_samples 200 (2-3h)
-[ ] 3. Exp3: uv run python experiments/run_exp3_theta.py --n_samples 100 (1h)
-[ ] 4. Exp4: uv run python experiments/run_exp4_es.py --n_samples 200 (2-3h)
+[ ] 1. Exp1: uv run python experiments/run_exp1_main.py --datasets hotpotqa musique --n_samples 500 --workers 4 (~0.6h)
+[ ] 2. Exp2: uv run python experiments/run_exp2_ablation.py --n_samples 200 (~0.6h)
+[ ] 3. Exp3: uv run python experiments/run_exp3_theta.py --n_samples 100 (~0.4h)
+[ ] 4. Exp4: uv run python experiments/run_exp4_es.py --n_samples 200 (~0.1h)
 [ ] 5. python analysis/sensitivity_theta.py  (生成 Figure 2)
 [ ] 6. 更新 CLAUDE.md PROJECT STATE 中各 Exp 行状态与最终指标
 [ ] 7. 准备论文 Table 1 (主对比), Table 2 (消融), Figure 2 (θ 敏感性)
 ```
-

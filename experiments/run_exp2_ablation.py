@@ -63,8 +63,8 @@ class DatasetPassageRetriever:
 
 
 def build_config(variant: str, theta: float) -> CBETConfig:
-    config = CBETConfig(theta=theta, tau=0.5, max_iterations=3, max_branches=6,
-                        gcs_conflict_threshold=0.35)
+    config = CBETConfig(theta=theta, tau=0.5, max_iterations=3, min_iterations=1,
+                        max_branches=6, gcs_conflict_threshold=0.35)
     if variant == "no_cross_branch":
         config.skip_cross_branch_nli = True
     elif variant == "no_override":
