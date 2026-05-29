@@ -53,22 +53,39 @@ def aggregate(logs: list[dict]) -> dict:
     f1_scores  = [log.get("f1",  _f1(log.get("answer",""), log.get("gold_answer",""))) for log in logs]
     iters      = [log.get("iterations", 1) for log in logs]
     cs_scores  = [log.get("final_cs", 0.0) for log in logs]
-    lm_calls   = [_estimate_lm_calls(log) for log in logs]
+    lm_calls   = [log.get("total_lm_calls", _estimate_lm_calls(log)) for log in logs]
+    ret_calls  = [log.get("retrieval_calls", log.get("iterations", 1)) for log in logs]
+    tokens     = [log.get("total_tokens_consumed", 0) for log in logs]
+    early_stop = [log.get("early_stopped", False) for log in logs]
 
     conflict_rate = sum(1 for l in logs if l.get("conflicts_detected")) / n
     override_rate = sum(1 for l in logs if l.get("overrides_triggered")) / n
     noisy_rate    = sum(1 for l in logs if l.get("noisy_evicted"))       / n
+    early_stop_rate = sum(early_stop) / n
+
+    # Contains% metric: answer contains gold answer (substring match)
+    contains_count = 0
+    for log in logs:
+        pred = log.get("answer", "").strip().lower()
+        gold = log.get("gold_answer", "").strip().lower()
+        if gold and gold in pred:
+            contains_count += 1
+    contains_rate = contains_count / n if n > 0 else 0.0
 
     return {
         "n":                        n,
         "em":                       100 * sum(em_scores) / n,
         "f1":                       100 * sum(f1_scores) / n,
+        "contains":                 100 * contains_rate,
         "avg_retrieval_rounds":     sum(iters)    / n,
         "avg_lm_calls":             sum(lm_calls) / n,
+        "avg_retrieval_calls":      sum(ret_calls) / n,
+        "avg_tokens_consumed":      sum(tokens)   / n,
         "avg_cs_at_stop":           sum(cs_scores) / n,
         "conflict_detected_rate":   100 * conflict_rate,
         "override_triggered_rate":  100 * override_rate,
         "noisy_branch_evicted_rate":100 * noisy_rate,
+        "early_stop_rate":          100 * early_stop_rate,
     }
 
 
@@ -114,13 +131,15 @@ _ADARAGUE_PAPER = {
 
 def _print_table(dataset: str, methods: dict[str, dict], use_paper_baselines: bool) -> None:
     print(f"\n=== Results on {dataset} (n={next(iter(methods.values()), {}).get('n', '?')}) ===")
-    header = f"{'Method':<18} {'EM':>6} {'F1':>6} {'Avg-Ret':>8} {'Avg-LM':>8}"
+    header = f"{'Method':<18} {'EM':>6} {'F1':>6} {'Contains%':>10} {'Avg-Ret':>8} {'Avg-LM':>8} {'EStop%':>7}"
     print(header)
     print("-" * len(header))
 
     def _row(label: str, m: dict) -> None:
-        print(f"{label:<18} {m['em']:>6.1f} {m['f1']:>6.1f} "
-              f"{m['avg_retrieval_rounds']:>8.1f} {m['avg_lm_calls']:>8.1f}")
+        contains = m.get('contains', 0.0)
+        estop = m.get('early_stop_rate', 0.0)
+        print(f"{label:<18} {m['em']:>6.1f} {m['f1']:>6.1f} {contains:>9.1f}% "
+              f"{m['avg_retrieval_rounds']:>8.1f} {m['avg_lm_calls']:>8.1f} {estop:>6.1f}%")
 
     # Baselines — prefer loaded results, fall back to paper numbers
     paper = _ADARAGUE_PAPER.get(dataset, {})
@@ -171,6 +190,152 @@ def _print_ablation_table(methods: dict[str, dict]) -> None:
                   f"{m['avg_retrieval_rounds']:>8.1f} {m['avg_lm_calls']:>8.1f}")
 
 
+# ── stratified analysis ───────────────────────────────────────────────────────
+
+def stratified_analysis(results_path: str, dataset: str):
+    """
+    HotpotQA: stratify by difficulty level (easy/medium/hard)
+      - Note: difficulty != hop count; use "question complexity" in paper
+
+    MuSiQue: stratify by real hop count (2hop/3hop/4hop from qid prefix)
+
+    Output format (HotpotQA example):
+    ┌──────────────┬──────┬──────┬──────┬──────┐
+    │    Method    │ All  │ easy │ med  │ hard │
+    ├──────────────┼──────┼──────┼──────┼──────┤
+    │ SingleRAG F1 │      │      │      │      │
+    │ CBET F1      │      │      │      │      │
+    │ Δ            │      │      │      │      │
+    └──────────────┴──────┴──────┴──────┴──────┘
+    """
+    if not Path(results_path).exists():
+        print(f"[WARN] {results_path} not found, skipping stratified analysis")
+        return
+
+    logs = _load(results_path)
+    if not logs:
+        return
+
+    # Determine stratification key
+    if dataset == "hotpotqa":
+        # HotpotQA: difficulty from 'difficulty' field or infer from qid
+        def get_stratum(log: dict) -> str:
+            return log.get("difficulty", "unknown")
+        strata_order = ["easy", "medium", "hard", "unknown"]
+        stratum_labels = {"easy": "easy", "medium": "med", "hard": "hard", "unknown": "?"}
+    elif dataset == "musique":
+        # MuSiQue: hop count from qid prefix (2hop__/3hop__/4hop__)
+        def get_stratum(log: dict) -> str:
+            qid = log.get("qid", "")
+            if qid.startswith("2hop__"):
+                return "2hop"
+            elif qid.startswith("3hop__"):
+                return "3hop"
+            elif qid.startswith("4hop__"):
+                return "4hop"
+            return "unknown"
+        strata_order = ["2hop", "3hop", "4hop", "unknown"]
+        stratum_labels = {"2hop": "2hop", "3hop": "3hop", "4hop": "4hop", "unknown": "?"}
+    else:
+        print(f"[INFO] Stratified analysis not implemented for {dataset}")
+        return
+
+    # Group logs by stratum
+    strata: dict[str, list[dict]] = {s: [] for s in strata_order}
+    for log in logs:
+        s = get_stratum(log)
+        if s in strata:
+            strata[s].append(log)
+
+    # Compute metrics per stratum
+    print(f"\n=== Stratified Analysis ({dataset}) ===")
+    header = f"{'Stratum':<10} {'N':>5} {'EM':>6} {'F1':>6} {'Avg-CS':>7} {'EStop%':>7}"
+    print(header)
+    print("-" * len(header))
+
+    for s in strata_order:
+        subset = strata[s]
+        if not subset:
+            continue
+        n = len(subset)
+        em = 100 * sum(log.get("em", 0) for log in subset) / n
+        f1 = 100 * sum(log.get("f1", 0) for log in subset) / n
+        cs = sum(log.get("final_cs", 0.0) for log in subset) / n
+        estop = 100 * sum(1 for log in subset if log.get("early_stopped", False)) / n
+        label = stratum_labels.get(s, s)
+        print(f"{label:<10} {n:>5} {em:>6.1f} {f1:>6.1f} {cs:>7.3f} {estop:>6.1f}%")
+
+
+# ── failure mode analysis ─────────────────────────────────────────────────────
+
+def failure_mode_analysis(results_path: str):
+    """
+    Analyze CBET failure modes:
+
+    Type A: "Confident but wrong" (high CS, EM=0)
+      - Definition: CS >= 0.5 and EM = 0
+      - Stats: proportion of early-stopped samples
+      - Possible causes: distractor dominance, bridge entity semantic drift,
+        internally consistent but incorrect reasoning chain
+
+    Type B: "Correct but low confidence" (CS~0, EM=1)
+      - Definition: CS < 0.1 and EM = 1
+      - Stats: count
+      - Possible causes: edge support fails to recognize semantically equivalent
+        bridge entities
+
+    Output format:
+    === Failure Mode Analysis ===
+    Type A (High CS, Wrong): X/500 (XX% of early stops)
+      Sample cases (print 3 examples):
+        - question / CBET answer / gold / CS score / edge_scores
+
+    Type B (Low CS, Correct): X/500 (XX% of correct answers)
+      Sample cases (print 3 examples):
+        - question / CBET answer / gold / CS score / edge_scores
+    """
+    if not Path(results_path).exists():
+        print(f"[WARN] {results_path} not found, skipping failure mode analysis")
+        return
+
+    logs = _load(results_path)
+    if not logs:
+        return
+
+    n = len(logs)
+
+    # Type A: high CS but wrong
+    type_a = [log for log in logs if log.get("final_cs", 0.0) >= 0.5 and log.get("em", 0) == 0]
+    early_stopped = [log for log in logs if log.get("early_stopped", False)]
+    type_a_pct_of_estop = (len(type_a) / len(early_stopped) * 100) if early_stopped else 0.0
+
+    # Type B: low CS but correct
+    type_b = [log for log in logs if log.get("final_cs", 0.0) < 0.1 and log.get("em", 0) == 1]
+    correct_answers = [log for log in logs if log.get("em", 0) == 1]
+    type_b_pct_of_correct = (len(type_b) / len(correct_answers) * 100) if correct_answers else 0.0
+
+    print(f"\n=== Failure Mode Analysis ===")
+    print(f"Type A (High CS, Wrong): {len(type_a)}/{n} ({type_a_pct_of_estop:.1f}% of early stops)")
+    print(f"Type B (Low CS, Correct): {len(type_b)}/{n} ({type_b_pct_of_correct:.1f}% of correct answers)")
+
+    # Print 3 examples of each type
+    print(f"\nType A samples (up to 3):")
+    for log in type_a[:3]:
+        print(f"  QID: {log.get('qid', '?')}")
+        print(f"    Answer: {log.get('answer', '')}")
+        print(f"    Gold: {log.get('gold_answer', '')}")
+        print(f"    CS: {log.get('final_cs', 0.0):.3f}")
+        print(f"    Edge scores: {log.get('edge_scores', [])}")
+
+    print(f"\nType B samples (up to 3):")
+    for log in type_b[:3]:
+        print(f"  QID: {log.get('qid', '?')}")
+        print(f"    Answer: {log.get('answer', '')}")
+        print(f"    Gold: {log.get('gold_answer', '')}")
+        print(f"    CS: {log.get('final_cs', 0.0):.3f}")
+        print(f"    Edge scores: {log.get('edge_scores', [])}")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -182,6 +347,10 @@ def main():
                         help="Show AdaRAGUE paper numbers when baseline JSONs are absent")
     parser.add_argument("--save_summary",       default=None,
                         help="Optional path to save aggregated metrics as JSON")
+    parser.add_argument("--stratified",         action="store_true",
+                        help="Run stratified analysis (difficulty/hop count)")
+    parser.add_argument("--failure_modes",      action="store_true",
+                        help="Run failure mode analysis")
     args = parser.parse_args()
 
     datasets = (
@@ -195,6 +364,20 @@ def main():
         if methods:
             _print_table(ds, methods, args.use_paper_baselines)
             all_metrics[ds] = methods
+
+            # Run stratified analysis if requested and CBET results exist
+            if args.stratified:
+                cbet_key = next((k for k in methods if k.startswith("cbet_")), None)
+                if cbet_key:
+                    cbet_path = str(Path(args.results_dir) / f"{cbet_key}.json")
+                    stratified_analysis(cbet_path, ds)
+
+            # Run failure mode analysis if requested and CBET results exist
+            if args.failure_modes:
+                cbet_key = next((k for k in methods if k.startswith("cbet_")), None)
+                if cbet_key:
+                    cbet_path = str(Path(args.results_dir) / f"{cbet_key}.json")
+                    failure_mode_analysis(cbet_path)
 
     # Ablation table (dataset-agnostic keys)
     all_methods = _find_results(args.results_dir, dataset=None)

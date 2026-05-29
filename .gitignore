@@ -2,6 +2,7 @@ AdaRAGUE
 pretrainedModels/
 models
 results
+.claude/
 
 
 # Byte-compiled / optimized / DLL files

@@ -823,6 +823,11 @@ def run(args):
 | DeBERTa truncation fix   | ✅ 完成   | 2026-05-28 | 所有 tokenizer 调用加 truncation=True, max_length=512; 5 次长文本 score_pair 无警告                     |
 | GCS → Edge Support       | ✅ 完成   | 2026-05-28 | DAG 边支撑验证替代跨分支矛盾; CS 均值=0.341, CS=0→0/50, EarlyStop%=34%; 14+9 tests pass                |
 | 50 条验证               | ⚠️ 部分   | 2026-05-28 | CS=0=0/50 ✅, EarlyStop=34% ✅; CBET F1=67.4 ≈ SingleRAG 67.8 (差 0.4) ⚠️; 无截断警告 ✅              |
+| min_iterations fix       | ⬜ 待验证 | 2026-05-28 | CBETConfig 新增 min_iterations=2；cbet_controller.py 停止判断已修改；configs/*.yaml 已更新；validation 脚本就绪 |
+| 分层分析函数             | ✅ 完成   | 2026-05-28 | analysis/evaluate_all.py: stratified_analysis() 支持 HotpotQA difficulty + MuSiQue hop count           |
+| Failure Mode 分析函数    | ✅ 完成   | 2026-05-28 | analysis/evaluate_all.py: failure_mode_analysis() 输出 Type A (高CS低EM) + Type B (低CS高EM)            |
+| 效率指标补全             | ✅ 完成   | 2026-05-28 | aggregate() 新增 contains, avg_retrieval_calls, avg_tokens_consumed, early_stop_rate; 表头含 EStop%      |
+| generate_paper_tables.py | ✅ 完成   | 2026-05-28 | analysis/generate_paper_tables.py: Table 1 (主对比), Table 2 (分层), Table 3 (消融), Figure (θ)         |
 
 ---
 
@@ -869,6 +874,9 @@ def run(args):
 - [2026-05-26] 7B 模型切换 → vLLM model id 从 `/models/qwen` (3B) 切换为 `qwen25-7b` (7B-Instruct, /root/autodl-tmp/Qwen2.5-7B-Instruct)；configs/cbet_7b.yaml 已更新；验证实验 20 样本显示 CBET F1=69.4 显著超过 SingleRAG F1=57.4，方法有效性确认
 - [2026-05-28] DeBERTa truncation → 加 truncation=True, max_length=512 → 长文档 NLI 静默截断导致 contradiction 检测随机化，是真实精度 bug
 - [2026-05-28] GCS 理论升级 → Edge Support Verification 替代 Cross-Branch Non-Contradiction → 旧方法：NLI(长证据, 长证据) → neutral → GCS≈0（独立子问题证据在 NLI 眼里天然 neutral，且超 512 截断）→ 新方法：compute_coverage(下游证据, 上游答案) 验证桥接实体（Bridge Entity）是否在推理链中成功传递 → 理论依据：多跳推理完备性 = 推理链所有节点间的桥接实体连通性 → 工程优势：短答案(1-5词) vs 长证据，彻底规避 512 截断问题 → 论文定位升级为："DAG-guided Multi-Branch Retrieval with Dependency-Aware Epistemic Convergence Estimation"
+- [2026-05-28] min_iterations=2 加入 CBETConfig → 原因：iteration=1 时 CS 高分反映初始检索置信度而非收敛；至少 1 次迭代后才有多轮比较基础 → 注意：此修改将 early stopping 语义从"完全自适应"改为"约束自适应（至少 N 轮后）"；论文中需如实说明 → 效果：待 validation 结果确认（不预设结论）
+- [2026-05-28] HotpotQA 分析策略修正 → HotpotQA difficulty level（easy/medium/hard）≠ hop count → 代码和论文中统一使用"question complexity / difficulty"而非"hop count"来描述 HotpotQA 的分层 → MuSiQue 的 hop count 来自真实标注，可以直接使用
+- [2026-05-28] Failure Mode 分析加入评估框架 → Type A（高CS低EM）和 Type B（低CS高EM）是理解方法边界的重要窗口 → 不预设原因，数据驱动分析
 
 ---
 

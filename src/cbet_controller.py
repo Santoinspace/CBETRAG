@@ -20,6 +20,7 @@ class CBETConfig:
     theta: float = 0.50
     tau: float = 0.5
     max_iterations: int = 5
+    min_iterations: int = 2  # require at least N iterations before early stopping
     max_branches: int = 6
     nli_claim_extraction: bool = True
     skip_cross_branch_nli: bool = False  # ablation: no_cross_branch
@@ -267,8 +268,8 @@ class CBETController:
                 dependency_pairs=dependency_pairs,
             )
 
-            # Step 7: stop if complete
-            if cs_result.should_stop:
+            # Step 7: stop if complete (only after min_iterations)
+            if cs_result.should_stop and iteration >= self.config.min_iterations:
                 break
 
             # Step 8: evict noisy branches for re-retrieval next iteration
@@ -300,6 +301,12 @@ class CBETController:
             **self.parametric_probe.lm_call_count,
         }
 
+        # Efficiency metrics
+        early_stopped = cs_result.should_stop if cs_result else False
+        stopping_iteration = iteration
+        retrieval_calls = iteration * len(dag.sub_questions)  # rough estimate
+        total_tokens_consumed = total_lm_calls * 256  # rough estimate: 256 tokens per LM call
+
         log = {
             "qid": question.qid,
             "iterations": iteration,
@@ -318,6 +325,10 @@ class CBETController:
             "f1": f1,
             "lm_breakdown": lm_breakdown,
             "total_lm_calls": total_lm_calls,
+            "early_stopped": early_stopped,
+            "stopping_iteration": stopping_iteration,
+            "retrieval_calls": retrieval_calls,
+            "total_tokens_consumed": total_tokens_consumed,
         }
         logger.info(json.dumps(log, ensure_ascii=False))
 
@@ -370,6 +381,7 @@ def _build_controller(args) -> "CBETController":
         theta=args.theta,
         tau=args.tau,
         max_iterations=args.max_iterations,
+        min_iterations=yaml_cfg.get("min_iterations", 2),
         nli_claim_extraction=(args.ablation != "entropy_only"),
         gcs_conflict_threshold=gcs_conflict_threshold,
     )

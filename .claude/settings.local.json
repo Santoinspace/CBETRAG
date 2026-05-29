@@ -32,5 +32,9 @@
       "Bash(curl -s --connect-timeout 3 http://localhost:8000/v1/models)",
       "Bash(echo \"EXIT=$?\")"
     ]
+  },
+  "skillOverrides": {
+    "exp-results": "off",
+    "skill-creator": "off"
   }
 }
