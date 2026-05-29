@@ -60,9 +60,30 @@ class SubQuestion:
 class QuestionDAG:
     root_query: str
     sub_questions: list[SubQuestion]
+    fallback: bool = False  # True if extraction failed and single-question fallback was used
 
     def get_leaves(self) -> list[SubQuestion]:
         return [sq for sq in self.sub_questions if sq.is_leaf]
+
+    def get_hop_count(self) -> int:
+        """Longest dependency chain in the DAG (= estimated hop count)."""
+        if not self.sub_questions:
+            return 0
+        id_to_sq = {sq.id: sq for sq in self.sub_questions}
+        memo: dict[str, int] = {}
+
+        def depth(sq_id: str) -> int:
+            if sq_id in memo:
+                return memo[sq_id]
+            sq = id_to_sq.get(sq_id)
+            if not sq or not sq.depends_on:
+                memo[sq_id] = 1
+                return 1
+            d = 1 + max(depth(dep) for dep in sq.depends_on if dep in id_to_sq)
+            memo[sq_id] = d
+            return d
+
+        return max(depth(sq.id) for sq in self.sub_questions)
 
     def get_execution_order(self) -> list[list[SubQuestion]]:
         """Topological sort — returns batches of sub-questions that can run in parallel."""
@@ -122,6 +143,7 @@ def _fallback_dag(query: str) -> QuestionDAG:
     return QuestionDAG(
         root_query=query,
         sub_questions=[SubQuestion(id="q1", text=query, depends_on=[], is_leaf=True)],
+        fallback=True,
     )
 
 

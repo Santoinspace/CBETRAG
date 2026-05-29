@@ -77,6 +77,31 @@ def build_corpus(q: Question) -> list[str]:
     return q.gold_passages + q.distractor_passages
 
 
+def check_model_consistency(llm: VLLMClient, expected_model: str) -> None:
+    """Verify vLLM server model matches expected model name.
+    Raises SystemExit on mismatch to prevent stale cache / wrong-model runs.
+    """
+    try:
+        models = llm._client.models.list()
+        server_models = [m.id for m in models.data]
+    except Exception as e:
+        print(f"  [WARN] Could not query vLLM models: {e}")
+        print(f"  Proceeding with model={expected_model} (manual verification required)")
+        return
+
+    if not server_models:
+        print(f"  [WARN] vLLM server returned empty model list")
+        return
+
+    if expected_model not in server_models:
+        print(f"  [ERROR] Expected model '{expected_model}' not found on vLLM server!")
+        print(f"  Available models: {server_models}")
+        print(f"  Fix: restart vLLM with the correct model, or pass --vllm_model <available>")
+        sys.exit(1)
+
+    print(f"  [OK] vLLM model consistency: '{expected_model}' found on server")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Baselines
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +183,10 @@ def run_cbet(q: Question, llm: VLLMClient, retriever: DatasetPassageRetriever,
         "retrieval_rounds": result.iterations,
         "lm_calls": result.log.get("total_lm_calls", 0),
         "dag_size": len(result.dag.sub_questions),
+        "dag_success": result.log.get("dag_success", not result.dag.fallback),
+        "dag_branches": result.log.get("dag_branches", len(result.dag.sub_questions)),
+        "dag_fallback": result.log.get("dag_fallback", result.dag.fallback),
+        "dag_hop_count": result.log.get("dag_hop_count", result.dag.get_hop_count()),
         "final_cs": result.cs_score,
         "conflicts_detected": len(result.log.get("conflicts_detected", [])),
         "overrides_triggered": len(result.log.get("overrides_triggered", [])),
@@ -250,6 +279,7 @@ def main():
 
     # Shared resources (NLIScorer on local GPU, LLM to cloud vLLM)
     llm = VLLMClient(base_url=args.vllm_url, model=args.vllm_model)
+    check_model_consistency(llm, args.vllm_model)
     nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="auto",
                      theta=args.theta, gcs_conflict_threshold=0.35)
 

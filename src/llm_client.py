@@ -33,8 +33,14 @@ class LLMClient(ABC):
 
     def _cache_key(self, prompt: str, max_new_tokens: int,
                    temperature: float) -> str:
-        """MD5 of full content — no truncation, eliminates collision risk."""
-        content = f"{prompt}|||{max_new_tokens}|||{temperature}"
+        """MD5 of model+params+content — prevents cross-model cache contamination."""
+        model_name = getattr(self, 'model_name', 'unknown')
+        content = (
+            f"model={model_name}|||"
+            f"temp={temperature}|||"
+            f"max_tokens={max_new_tokens}|||"
+            f"prompt={prompt}"
+        )
         return hashlib.md5(content.encode('utf-8')).hexdigest()
 
     def generate(self, prompt: str, max_new_tokens: int = 512,
@@ -99,6 +105,7 @@ class AWQClient(LLMClient):
         from awq import AutoAWQForCausalLM
         from transformers import AutoTokenizer
         torch.manual_seed(seed)
+        self.model_name = model_path
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
         self.model = AutoAWQForCausalLM.from_quantized(
             model_path, fuse_layers=True, trust_remote_code=False, safetensors=True
@@ -138,6 +145,7 @@ class HFClient(LLMClient):
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM
         torch.manual_seed(seed)
+        self.model_name = model_path
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=torch.bfloat16, device_map=device
@@ -184,6 +192,8 @@ class VLLMClient(LLMClient):
         self._client = OpenAI(api_key=api_key, base_url=base_url)
         self._model = model
         self._seed = seed
+        self.model_name = model
+        self.base_url = base_url
 
     def _generate(self, prompt: str, max_new_tokens: int = 512,
                   temperature: float = 0.0) -> LLMResponse:

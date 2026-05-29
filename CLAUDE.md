@@ -836,6 +836,9 @@ def run(args):
 | 多线程并行化               | ✅ 完成     | 2026-05-29 | src/experiment_runner.py, ThreadPoolExecutor max_workers=4; (question,method) 对为并行单元                                             |
 | min_iterations=1 锁定      | ✅ 完成     | 2026-05-29 | 50 条验证: min_iter=1 与 =2 结果完全一致；CS 公式内生驱动多跳，无需启发式约束                                                          |
 | 配置与环境检查             | ✅ 完成     | 2026-05-29 | 锁定 min_iter=1，max_iter=3；4 个 configs + 4 个实验脚本全部统一；多线程与续跑逻辑就绪                                                 |
+| LLM 缓存 key 加固          | ✅ 完成     | 2026-05-29 | model_name 加入 MD5 key；AWQ/HF/VLLMClient 均设置 self.model_name；防跨模型缓存污染                                                    |
+| DAG 遥测字段               | ✅ 完成     | 2026-05-29 | dag_success/dag_fallback/dag_branches/dag_hop_count 加入 exp1/exp2 返回 dict；evaluate_all.py aggregate() 新增 DAG 列；failure_mode 新增 Type C |
+| vLLM 模型一致性检查        | ✅ 完成     | 2026-05-29 | run_exp1_main.py 新增 check_model_consistency()；启动前 models.list() 验证，不匹配 sys.exit(1)                                        |
 | Exp1 全量 500 条           | ⬜ 待执行   | -          | hotpotqa 0/500 待启动（重跑），musique 0/500 待启动；预计 ~0.6h                                                                        |
 | Exp2 消融 200 条           | ⬜ 待执行   | -          | 5 variants x 200 samples；预计 ~0.6h                                                                                                   |
 | Exp3 θ 敏感性             | ⬜ 待执行   | -          | 7 theta values x 100 samples；预计 ~0.4h                                                                                               |
@@ -895,6 +898,9 @@ def run(args):
 - [2026-05-29] 样本级多线程并行化（ThreadPoolExecutor, max_workers=4）→ vLLM 云端调用为网络 I/O 密集型；LLM 等待期间本地 GPU 并发处理 NLI；NLIScorer 跨线程共享（缓存加锁），run_exp1_main.py 使用 (question, method) 对作为并行单元
 - [2026-05-29] 锁定 min_iter=1 并启动全量实验 → 50 条实验显示，即使设置 min_iter=1，系统也从未在第一轮错误早停。这证明了 Edge Support 完备性公式的强大：它能内生地（endogenously）识别首轮孤立检索的不完备性，自主驱动进入第二轮多跳检索，无需任何人工硬编码的启发式最小轮数（Heuristic bounds）。这对增强论文的理论纯粹性具有决定性意义。
 - [2026-05-29] Wrong Early Stop 根因记录 → 发现少数 CS 虚高的样本并非迭代轮数问题，而是 NLI 将 distractor 中包含的 bridge entity 判定为强支撑（自洽的干扰项）。这将在论文的 Failure Mode Analysis 中如实记录为"自洽性幻觉"，留作 Future Work 处理，全量数据将提供其真实发生率分布。
+- [2026-05-29] LLM 缓存 key 加固（防跨模型污染）→ `_cache_key()` 将 model_name 加入 MD5 哈希内容 → 根因：3B 与 7B 实验共享相同 prompt 时，旧 key 仅含 temp+max_tokens+prompt，会导致 3B 缓存结果被 7B 实验命中，污染实验数据；修复后所有子类 (AWQClient/HFClient/VLLMClient) 均在 `__init__` 中设置 `self.model_name`
+- [2026-05-29] DAG 遥测字段加入结果 JSON → 新增 dag_success/dag_fallback/dag_branches/dag_hop_count → 目的：区分"CBET 正常运行"与"CBET 因 DAG 提取失败退化为 flat IterativeRAG"；run_exp1_main.py、run_exp2_ablation.py 的 run_cbet/run_variant 返回 dict 统一更新；analysis/evaluate_all.py aggregate() 新增 dag_success_rate、avg_dag_branches、dag_fallback_rate、avg_dag_hop_count；failure_mode_analysis() 新增 Type C（DAG fallback 样本对比）
+- [2026-05-29] vLLM 模型一致性检查 → run_exp1_main.py 新增 `check_model_consistency()` → 启动前通过 OpenAI models.list() API 验证 vLLM server 上的模型 ID 与 --vllm_model 参数匹配；不匹配时 sys.exit(1) 防止错误配置运行实验
 
 ---
 

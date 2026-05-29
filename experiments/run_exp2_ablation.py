@@ -79,7 +79,7 @@ def build_config(variant: str, theta: float) -> CBETConfig:
 def run_variant(q: Question, llm: VLLMClient, variant: str, theta: float) -> dict:
     t0 = time.time()
     retriever = DatasetPassageRetriever(q.gold_passages + q.distractor_passages)
-    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="cpu",
+    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="auto",
                      theta=theta, gcs_conflict_threshold=0.35)
     probe = ParametricProbe(llm)
     config = build_config(variant, theta)
@@ -91,6 +91,10 @@ def run_variant(q: Question, llm: VLLMClient, variant: str, theta: float) -> dic
         "retrieval_rounds": result.iterations,
         "lm_calls": result.log.get("total_lm_calls", 0),
         "dag_size": len(result.dag.sub_questions),
+        "dag_success": result.log.get("dag_success", not result.dag.fallback),
+        "dag_branches": result.log.get("dag_branches", len(result.dag.sub_questions)),
+        "dag_fallback": result.log.get("dag_fallback", result.dag.fallback),
+        "dag_hop_count": result.log.get("dag_hop_count", result.dag.get_hop_count()),
         "final_cs": result.cs_score,
         "gcs": result.log.get("gcs", 0.0),
         "conflicts_detected": len(result.log.get("conflicts_detected", [])),

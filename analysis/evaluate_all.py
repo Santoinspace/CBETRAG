@@ -72,6 +72,39 @@ def aggregate(logs: list[dict]) -> dict:
             contains_count += 1
     contains_rate = contains_count / n if n > 0 else 0.0
 
+    # DAG telemetry: success rate, avg branches, fallback rate, avg hop count
+    dag_success_keys = ("dag_success",)
+    dag_fb_keys = ("dag_fallback",)
+    dag_br_keys = ("dag_branches", "dag_size")
+    dag_hop_keys = ("dag_hop_count",)
+
+    dag_success_count = 0
+    dag_fallback_count = 0
+    dag_branches_list = []
+    dag_hop_list = []
+    for log in logs:
+        # dag_success: True if DAG extraction succeeded
+        if log.get("dag_success") is True or (log.get("dag_success") is None and not log.get("dag_fallback", False)):
+            dag_success_count += 1
+        # dag_fallback: True if extraction fell back to single-node
+        if log.get("dag_fallback", False):
+            dag_fallback_count += 1
+        # branch count
+        for key in dag_br_keys:
+            if key in log:
+                dag_branches_list.append(log[key])
+                break
+        # hop count
+        for key in dag_hop_keys:
+            if key in log:
+                dag_hop_list.append(log[key])
+                break
+
+    dag_success_rate = dag_success_count / n if n > 0 else 0.0
+    dag_fallback_rate = dag_fallback_count / n if n > 0 else 0.0
+    avg_dag_branches = sum(dag_branches_list) / len(dag_branches_list) if dag_branches_list else 0.0
+    avg_dag_hop = sum(dag_hop_list) / len(dag_hop_list) if dag_hop_list else 0.0
+
     return {
         "n":                        n,
         "em":                       100 * sum(em_scores) / n,
@@ -86,6 +119,10 @@ def aggregate(logs: list[dict]) -> dict:
         "override_triggered_rate":  100 * override_rate,
         "noisy_branch_evicted_rate":100 * noisy_rate,
         "early_stop_rate":          100 * early_stop_rate,
+        "dag_success_rate":         100 * dag_success_rate,
+        "avg_dag_branches":         avg_dag_branches,
+        "dag_fallback_rate":        100 * dag_fallback_rate,
+        "avg_dag_hop_count":        avg_dag_hop,
     }
 
 
@@ -131,15 +168,20 @@ _ADARAGUE_PAPER = {
 
 def _print_table(dataset: str, methods: dict[str, dict], use_paper_baselines: bool) -> None:
     print(f"\n=== Results on {dataset} (n={next(iter(methods.values()), {}).get('n', '?')}) ===")
-    header = f"{'Method':<18} {'EM':>6} {'F1':>6} {'Contains%':>10} {'Avg-Ret':>8} {'Avg-LM':>8} {'EStop%':>7}"
+    header = (f"{'Method':<18} {'EM':>6} {'F1':>6} {'Contains%':>10} "
+              f"{'Avg-Ret':>8} {'Avg-LM':>8} {'EStop%':>7} "
+              f"{'DAG_Succ%':>10} {'Avg_Br':>7}")
     print(header)
     print("-" * len(header))
 
     def _row(label: str, m: dict) -> None:
         contains = m.get('contains', 0.0)
         estop = m.get('early_stop_rate', 0.0)
+        dag_succ = m.get('dag_success_rate', 0.0)
+        avg_br = m.get('avg_dag_branches', 0.0)
         print(f"{label:<18} {m['em']:>6.1f} {m['f1']:>6.1f} {contains:>9.1f}% "
-              f"{m['avg_retrieval_rounds']:>8.1f} {m['avg_lm_calls']:>8.1f} {estop:>6.1f}%")
+              f"{m['avg_retrieval_rounds']:>8.1f} {m['avg_lm_calls']:>8.1f} {estop:>6.1f}% "
+              f"{dag_succ:>9.1f}% {avg_br:>7.2f}")
 
     # Baselines — prefer loaded results, fall back to paper numbers
     paper = _ADARAGUE_PAPER.get(dataset, {})
@@ -161,7 +203,10 @@ def _print_table(dataset: str, methods: dict[str, dict], use_paper_baselines: bo
         print(f"  avg_cs_at_stop={m['avg_cs_at_stop']:.3f}  "
               f"conflict_rate={m['conflict_detected_rate']:.1f}%  "
               f"override_rate={m['override_triggered_rate']:.1f}%  "
-              f"noisy_evicted={m['noisy_branch_evicted_rate']:.1f}%")
+              f"noisy_evicted={m['noisy_branch_evicted_rate']:.1f}%  "
+              f"dag_success={m.get('dag_success_rate',0):.1f}%  "
+              f"avg_dag_br={m.get('avg_dag_branches',0):.2f}  "
+              f"dag_fallback={m.get('dag_fallback_rate',0):.1f}%")
 
     print("  (* = AdaRAGUE paper numbers, not re-run)")
 
@@ -314,9 +359,22 @@ def failure_mode_analysis(results_path: str):
     correct_answers = [log for log in logs if log.get("em", 0) == 1]
     type_b_pct_of_correct = (len(type_b) / len(correct_answers) * 100) if correct_answers else 0.0
 
+    # Type C: DAG fallback samples — CBET degraded to flat IterativeRAG (single-node DAG)
+    type_c = [log for log in logs if log.get("dag_fallback", False)]
+    type_c_em = (100 * sum(1 for log in type_c if log.get("em", 0) == 1) / len(type_c)) if type_c else 0.0
+    type_c_f1 = (100 * sum(_f1(log.get("answer", ""), log.get("gold_answer", "")) for log in type_c) / len(type_c)) if type_c else 0.0
+    non_c = [log for log in logs if not log.get("dag_fallback", False)]
+    non_c_em = (100 * sum(1 for log in non_c if log.get("em", 0) == 1) / len(non_c)) if non_c else 0.0
+    non_c_f1 = (100 * sum(_f1(log.get("answer", ""), log.get("gold_answer", "")) for log in non_c) / len(non_c)) if non_c else 0.0
+
     print(f"\n=== Failure Mode Analysis ===")
     print(f"Type A (High CS, Wrong): {len(type_a)}/{n} ({type_a_pct_of_estop:.1f}% of early stops)")
     print(f"Type B (Low CS, Correct): {len(type_b)}/{n} ({type_b_pct_of_correct:.1f}% of correct answers)")
+    print(f"Type C (DAG fallback): {len(type_c)}/{n} "
+          f"({100*len(type_c)/n:.1f}% of total)")
+    if type_c:
+        print(f"  DAG fallback samples — EM={type_c_em:.1f}, F1={type_c_f1:.1f}")
+        print(f"  Non-fallback samples — EM={non_c_em:.1f}, F1={non_c_f1:.1f}")
 
     # Print 3 examples of each type
     print(f"\nType A samples (up to 3):")
@@ -334,6 +392,13 @@ def failure_mode_analysis(results_path: str):
         print(f"    Gold: {log.get('gold_answer', '')}")
         print(f"    CS: {log.get('final_cs', 0.0):.3f}")
         print(f"    Edge scores: {log.get('edge_scores', [])}")
+
+    print(f"\nType C samples (up to 3):")
+    for log in type_c[:3]:
+        print(f"  QID: {log.get('qid', '?')}")
+        print(f"    Query: {log.get('query', log.get('root_query', ''))[:80]}")
+        print(f"    Answer: {log.get('answer', '')}  |  Gold: {log.get('gold_answer', '')}")
+        print(f"    CS: {log.get('final_cs', 0.0):.3f}  |  EM: {log.get('em', 0)}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
