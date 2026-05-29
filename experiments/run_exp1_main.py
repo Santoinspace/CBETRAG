@@ -1,7 +1,7 @@
 """Main experiment: NoRAG / SingleRAG / IterativeRAG / CBET on HotpotQA + MuSiQue.
 
 Dataset-passage retriever (gold+distractor) — isolates method behavior from retrieval quality.
-Expected runtime: 3-5h on RTX 4060 + vLLM 7B.
+Expected runtime: 3-5h on RTX 4060 + vLLM 7B (reduced with parallel workers).
 
 Supports interrupt/resume: if the output JSON already exists, processed (method, qid) pairs
 are loaded and skipped.
@@ -10,7 +10,8 @@ Usage:
     uv run python experiments/run_exp1_main.py \
         --datasets hotpotqa musique \
         --n_samples 500 \
-        --vllm_model qwen25-7b
+        --vllm_model qwen25-7b \
+        --workers 4
 """
 from __future__ import annotations
 import argparse
@@ -28,6 +29,7 @@ from src.dag_extractor import extract_dag
 from src.parametric_probe import ParametricProbe
 from src.epistemic_override import EpistemicOverrider
 from src.nli_scorer import NLIScorer
+from src.experiment_runner import run_experiment_parallel
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -142,10 +144,9 @@ def run_iterativerag(q: Question, llm: VLLMClient, retriever: DatasetPassageRetr
 
 
 def run_cbet(q: Question, llm: VLLMClient, retriever: DatasetPassageRetriever,
-             theta: float = 0.50) -> dict:
+             nli: NLIScorer, theta: float = 0.50) -> dict:
+    """Run CBET with a SHARED NLIScorer (cache reused across samples)."""
     t0 = time.time()
-    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="cpu",
-                     theta=theta, gcs_conflict_threshold=0.35)
     probe = ParametricProbe(llm)
     config = CBETConfig(theta=theta, tau=0.5, max_iterations=3, max_branches=6,
                         gcs_conflict_threshold=0.35)
@@ -237,54 +238,81 @@ def main():
     parser.add_argument("--vllm_model", default="qwen25-7b")
     parser.add_argument("--theta", type=float, default=0.50)
     parser.add_argument("--output", default="experiments/results/exp1_main.json")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel workers (2-3 conservative, 4-6 recommended)")
     args = parser.parse_args()
 
     methods = set(args.methods.split(","))
     print("=" * 80)
     print(f"Exp1 — Main Comparison: {args.datasets}, n={args.n_samples}, methods={sorted(methods)}")
-    print(f"vLLM: {args.vllm_url} / {args.vllm_model}, theta={args.theta}")
+    print(f"vLLM: {args.vllm_url} / {args.vllm_model}, theta={args.theta}, workers={args.workers}")
     print("=" * 80)
 
+    # Shared resources (NLIScorer on local GPU, LLM to cloud vLLM)
     llm = VLLMClient(base_url=args.vllm_url, model=args.vllm_model)
+    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="auto",
+                     theta=args.theta, gcs_conflict_threshold=0.35)
+
     all_results, done = load_completed(args.output)
 
     for ds in args.datasets:
         print(f"\n=== Dataset: {ds} ===")
         questions = load_dataset(ds, n_samples=args.n_samples)
-        print(f"Loaded {len(questions)} questions")
+        # Filter out already-completed questions (all methods done)
+        pending = []
+        for q in questions:
+            qid_done = all((m, q.qid) in done for m in methods)
+            if not qid_done:
+                pending.append(q)
+        print(f"Loaded {len(questions)} questions, {len(pending)} pending")
 
-        for i, q in enumerate(questions):
-            print(f"\n[{i+1}/{len(questions)}] {safe_str(q.query[:100])}...")
-            retriever = DatasetPassageRetriever(build_corpus(q))
+        if not pending:
+            continue
 
+        # Build flat task list: (question, method) pairs
+        tasks = []
+        for q in pending:
             if "NoRAG" in methods and ("NoRAG", q.qid) not in done:
-                r = run_norag(q, llm)
-                all_results.append(r); done.add(("NoRAG", q.qid))
-                print(f"  NoRAG: '{safe_str(r['answer'], 40)}' EM={em_score(r['answer'], q.answer)}")
-
+                tasks.append((q, "NoRAG"))
             if "SingleRAG" in methods and ("SingleRAG", q.qid) not in done:
-                r = run_singlerag(q, llm, retriever)
-                all_results.append(r); done.add(("SingleRAG", q.qid))
-                print(f"  SingleRAG: '{safe_str(r['answer'], 40)}' EM={em_score(r['answer'], q.answer)}")
-
+                tasks.append((q, "SingleRAG"))
             if "IterativeRAG" in methods and ("IterativeRAG", q.qid) not in done:
-                r = run_iterativerag(q, llm, retriever)
-                all_results.append(r); done.add(("IterativeRAG", q.qid))
-                print(f"  IterRAG: '{safe_str(r['answer'], 40)}' EM={em_score(r['answer'], q.answer)}")
-
+                tasks.append((q, "IterativeRAG"))
             if "CBET" in methods and ("CBET", q.qid) not in done:
-                r = run_cbet(q, llm, retriever, theta=args.theta)
-                all_results.append(r); done.add(("CBET", q.qid))
-                print(f"  CBET: '{safe_str(r['answer'], 40)}' EM={em_score(r['answer'], q.answer)} "
-                      f"DAG={r.get('dag_size')} CS={r.get('final_cs',0):.3f}")
+                tasks.append((q, "CBET"))
 
-            # Periodic save every 10 questions
-            if (i + 1) % 10 == 0:
-                save_results(args.output, all_results)
-                print(f"  [saved checkpoint: {len(all_results)} rows]")
+        def process_task(task):
+            """Process one (question, method) pair."""
+            q, method = task
+            retriever = DatasetPassageRetriever(build_corpus(q))
+            if method == "NoRAG":
+                return run_norag(q, llm)
+            elif method == "SingleRAG":
+                return run_singlerag(q, llm, retriever)
+            elif method == "IterativeRAG":
+                return run_iterativerag(q, llm, retriever)
+            elif method == "CBET":
+                return run_cbet(q, llm, retriever, nli, theta=args.theta)
+            return {"qid": q.qid, "method": method, "error": "unknown method"}
+
+        # Run in parallel (no checkpoint_fn — save after completion)
+        batch_results = run_experiment_parallel(
+            questions=tasks,
+            method_fn=process_task,
+            max_workers=args.workers,
+            checkpoint_every=50,
+            checkpoint_fn=None,
+            desc=f"{ds} tasks",
+        )
+
+        all_results.extend(batch_results)
+        save_results(args.output, all_results)
+        print(f"  Saved checkpoint: {len(all_results)} total results")
 
     save_results(args.output, all_results)
     print(f"\nSaved {len(all_results)} results to {args.output}")
+    print(f"LLM: {llm.cache_stats()}")
+    print(f"NLI: {nli.cache_stats()}")
 
     # Summary table
     rows = []

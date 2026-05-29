@@ -4,9 +4,11 @@ Model: cross-encoder/nli-deberta-v3-base (default, ~0.4 GB VRAM on RTX 4060).
 Label order for DeBERTa cross-encoder NLI: [contradiction, entailment, neutral]
 """
 from __future__ import annotations
+import hashlib
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from itertools import combinations
 
@@ -59,24 +61,45 @@ class NLIScorer:
     def __init__(
         self,
         model_path: str = "./models/nli-deberta-v3-base",
-        device: str = "cuda",
-        batch_size: int = 16,
+        device: str = "auto",
+        batch_size: int = 32,
         theta: float = 0.75,
         gcs_conflict_threshold: float = 0.35,
     ):
         from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-        self.device = device
-        self.batch_size = batch_size
+        # Task 1: auto-detect GPU (vLLM migrated to cloud, local 4060 fully available)
+        if device == "auto":
+            import torch
+            if torch.cuda.is_available():
+                self.device = "cuda"
+                self.batch_size = batch_size
+            else:
+                self.device = "cpu"
+                self.batch_size = 16
+                print("⚠️  CUDA not available, NLI running on CPU (slower)")
+        else:
+            self.device = device
+            self.batch_size = batch_size
+
+        print(f"[NLIScorer] device={self.device}, batch_size={self.batch_size}")
+
         self.theta = theta
         self.gcs_conflict_threshold = gcs_conflict_threshold
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.model = (
             AutoModelForSequenceClassification.from_pretrained(model_path)
-            .to(device)
+            .to(self.device)
             .eval()
         )
         self.lm_call_count: dict[str, int] = {}
+
+        # Task 4: in-memory NLI cache with thread safety
+        self._nli_cache: dict[str, NLIResult] = {}
+        self._cache_lock = threading.Lock()
+        self._tokenizer_lock = threading.Lock()
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
@@ -94,23 +117,46 @@ class NLIScorer:
         kept = ids[:half] + ids[-half:]
         return self.tokenizer.decode(kept, skip_special_tokens=True)
 
-    def _batch_score(self, pairs: list[tuple[str, str]]) -> list[NLIResult]:
-        """Run NLI on a list of (premise, hypothesis) pairs in batches."""
+    # ── caching ──────────────────────────────────────────────────────────────
+
+    def _make_cache_key(self, premise: str, hypothesis: str) -> str:
+        """MD5 of full content — no truncation, eliminates collision risk."""
+        content = f"{premise}|||{hypothesis}"
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+    def cache_stats(self) -> str:
+        with self._cache_lock:
+            hits = self._cache_hits
+            misses = self._cache_misses
+        total = hits + misses
+        if total == 0:
+            return "No NLI calls yet"
+        return (f"NLI cache: {hits}/{total} "
+                f"hits ({hits/total*100:.0f}%)")
+
+    # ── batch inference (Task 2) ─────────────────────────────────────────────
+
+    def score_batch(self, pairs: list[tuple[str, str]]) -> list[NLIResult]:
+        """Run NLI on multiple (premise, hypothesis) pairs in a single forward pass."""
         import torch
         import torch.nn.functional as F
+        if not pairs:
+            return []
         results: list[NLIResult] = []
         for i in range(0, len(pairs), self.batch_size):
             batch = pairs[i : i + self.batch_size]
-            premises = [self._truncate(p) for p, _ in batch]
-            hypotheses = [self._truncate(h) for _, h in batch]
-            enc = self.tokenizer(
-                premises,
-                hypotheses,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            ).to(self.device)
+            # Tokenizer lock: Rust tokenizer is not re-entrant across threads
+            with self._tokenizer_lock:
+                premises = [self._truncate(p) for p, _ in batch]
+                hypotheses = [self._truncate(h) for _, h in batch]
+                enc = self.tokenizer(
+                    premises,
+                    hypotheses,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt",
+                ).to(self.device)
             with torch.no_grad():
                 logits = self.model(**enc).logits          # (B, 3)
             probs = F.softmax(logits, dim=-1).cpu().tolist()
@@ -125,6 +171,32 @@ class NLIScorer:
                     )
                 )
         return results
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def score_pair(self, premise: str, hypothesis: str) -> NLIResult:
+        """Score a single (premise, hypothesis) pair with in-memory caching."""
+        cache_key = self._make_cache_key(premise, hypothesis)
+
+        # Read: check cache under lock
+        with self._cache_lock:
+            if cache_key in self._nli_cache:
+                self._cache_hits += 1
+                return self._nli_cache[cache_key]
+
+        # Inference: outside lock — allows concurrent GPU inference
+        self._cache_misses += 1
+        try:
+            result = self.score_batch([(premise, hypothesis)])[0]
+        except Exception as e:
+            logger.warning("NLI score_pair failed: %s", e)
+            result = NLIResult(label="neutral", entailment_score=0.0,
+                               neutral_score=1.0, contradiction_score=0.0)
+
+        # Write: under lock
+        with self._cache_lock:
+            self._nli_cache[cache_key] = result
+        return result
 
     # ── claim parsing pipeline ─────────────────────────────────────────────────
 
@@ -312,15 +384,6 @@ class NLIScorer:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def score_pair(self, premise: str, hypothesis: str) -> NLIResult:
-        """Score a single (premise, hypothesis) pair."""
-        try:
-            return self._batch_score([(premise, hypothesis)])[0]
-        except Exception as e:
-            logger.warning("NLI score_pair failed: %s", e)
-            return NLIResult(label="neutral", entailment_score=0.0,
-                             neutral_score=1.0, contradiction_score=0.0)
-
     def extract_atomic_claims(self, text: str, llm_client: LLMClient) -> list[str]:
         """Use LLM to extract atomic factual claims from text."""
         self.lm_call_count["atomic_claims"] = self.lm_call_count.get("atomic_claims", 0) + 1
@@ -346,7 +409,7 @@ class NLIScorer:
         try:
             claims = self.extract_atomic_claims(evidence, llm_client)
             pairs = [(claim, sub_answer) for claim in claims]
-            results = self._batch_score(pairs)
+            results = self.score_batch(pairs)
             return max(r.entailment_score for r in results)
         except Exception as e:
             logger.warning("compute_coverage failed: %s", e)
@@ -375,7 +438,7 @@ class NLIScorer:
                     continue
                 valid += 1
                 cross = [(c_i, c_j) for c_i in claims_i for c_j in claims_j]
-                results = self._batch_score(cross)
+                results = self.score_batch(cross)
                 n_contra = sum(1 for r in results if r.label == "contradiction")
                 conflict_ratio = n_contra / total_pairs
                 if conflict_ratio > self.gcs_conflict_threshold:
@@ -468,7 +531,7 @@ class NLIScorer:
             try:
                 ans = branch_answers[i]
                 pairs = [(claim, ans) for claim in all_claims[i]]
-                results = self._batch_score(pairs)
+                results = self.score_batch(pairs)
                 coverages.append(max(r.entailment_score for r in results))
             except Exception as e:
                 logger.warning("compute_coverage failed: %s", e)

@@ -11,9 +11,12 @@ from src.dag_extractor import extract_dag, QuestionDAG, SubQuestion
 
 class MockLLM(LLMClient):
     def __init__(self, response: str):
+        import tempfile
+        super().__init__(cache_dir=tempfile.mkdtemp(prefix="test_llm_cache_"))
         self._response = response
 
-    def generate(self, prompt: str, **kwargs) -> LLMResponse:
+    def _generate(self, prompt: str, max_new_tokens: int = 512,
+                  temperature: float = 0.0, **kwargs) -> LLMResponse:
         return LLMResponse(text=self._response)
 
 

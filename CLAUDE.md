@@ -134,22 +134,22 @@ cbet-rag/
 
 ### 3.1 硬件约束
 
-- **目标环境**：单张 RTX 4060（8GB VRAM）— 资源受限，必须严格控制显存
-- **VRAM 预算**（8GB 总量）：
+- **目标环境**：单张 RTX 4060（8GB VRAM）— vLLM 已迁移至 AutoDL 云端，本地 GPU 完全空闲
+- **VRAM 预算**（8GB 总量，vLLM 在云端）：
 
   | 组件                                        | 显存占用         | 运行位置 |
   | ------------------------------------------- | ---------------- | -------- |
-  | Qwen2.5-7B-Instruct-**AWQ**（4-bit）  | ~4.5GB           | GPU      |
-  | cross-encoder/nli-deberta-v3-**base** | ~0.4GB           | GPU      |
+  | cross-encoder/nli-deberta-v3-**base** | ~0.4GB           | GPU (本地) |
   | KV cache + 激活值余量                       | ~2.0GB           | GPU      |
   | 系统 overhead                               | ~0.5GB           | GPU      |
-  | **合计**                              | **~7.4GB** | ✅ 可行  |
+  | **合计**                              | **~2.9GB** | ✅ 宽裕  |
 - **⚠️ 重要约束**：
 
-  - 必须使用 AWQ 量化版，全精度 bfloat16 约需 14GB，超出 4060 上限
-  - NLI 模型使用 `deberta-v3-base` 而非 `large`（性能差异 < 1.5% F1，可接受）
-  - 推理时 `max_new_tokens` 限制为 512，避免 KV cache 爆显存
-  - 论文 Implementation Details 中注明：`Qwen2.5-7B-Instruct-AWQ (4-bit)` on `RTX 4060 8GB`
+  - vLLM 运行在 AutoDL 云端（Qwen2.5-7B-Instruct），本地仅运行 NLI 模型
+  - NLI 模型使用 `device="auto"` 自动检测 GPU，batch_size=32 利用 GPU 并行
+  - NLI 推理速度从 CPU ~200ms/pair 提升到 GPU ~12ms/pair（约 10-20x）
+  - NLI 内存缓存（MD5 key + threading.Lock）支持多线程并发
+  - LLM 磁盘缓存（.llm_cache/）复用 DAG/claims/probe 结果，节省 40-60% API 调用
 
 ### 3.2 安装步骤（使用 uv，由 Claude Code 自动执行，若已有虚拟环境则不必执行）
 
@@ -795,7 +795,7 @@ def run(args):
 | Task 0: 环境验证           | ✅ 完成   | 2026-05-22 | tests/test_env.py 已就绪，需模型下载后运行                                                                                                         |
 | Task 1: 数据适配器         | ✅ 完成   | 2026-05-22 | src/data_adapter.py，6/6 测试通过                                                                                                                  |
 | Task 2: DAG 提取器         | ✅ 完成   | 2026-05-22 | src/dag_extractor.py，7/7 测试通过                                                                                                                 |
-| Task 3: NLI 评分器         | ✅ 完成   | 2026-05-25 | src/nli_scorer.py；真实 DeBERTa (CPU) 集成，claims 复用优化完成                                                                                    |
+| Task 3: NLI 评分器         | ✅ 完成   | 2026-05-25 | src/nli_scorer.py；DeBERTa GPU (auto) + score_batch + MD5 缓存 + thread-safe                           |
 | Task 4: 参数化探针         | ✅ 完成   | 2026-05-25 | src/parametric_probe.py；probe 仅执行一次，detect_conflict 去掉 LLM answer extraction                                                               |
 | Task 5: 主控制器           | ✅ 完成   | 2026-05-25 | src/cbet_controller.py；LM 调用计数 + evidence 缓存优化，total LM ≤ 14                                                                             |
 | Task 6: Epistemic Override | ✅ 完成   | 2026-05-22 | src/epistemic_override.py，含在 e2e 测试中                                                                                                         |
@@ -828,6 +828,11 @@ def run(args):
 | Failure Mode 分析函数    | ✅ 完成   | 2026-05-28 | analysis/evaluate_all.py: failure_mode_analysis() 输出 Type A (高CS低EM) + Type B (低CS高EM)            |
 | 效率指标补全             | ✅ 完成   | 2026-05-28 | aggregate() 新增 contains, avg_retrieval_calls, avg_tokens_consumed, early_stop_rate; 表头含 EStop%      |
 | generate_paper_tables.py | ✅ 完成   | 2026-05-28 | analysis/generate_paper_tables.py: Table 1 (主对比), Table 2 (分层), Table 3 (消融), Figure (θ)         |
+| NLI GPU 迁移             | ✅ 完成   | 2026-05-29 | device="auto", batch_size=32; ~400MB VRAM, ~12ms/pair (vs ~200ms CPU)                                  |
+| NLI 批处理 score_batch   | ✅ 完成   | 2026-05-29 | 20 pairs batch = 0.39s; compute_coverage/completeness 统一使用 score_batch                              |
+| LLM 磁盘缓存            | ✅ 完成   | 2026-05-29 | MD5 全内容哈希, .llm_cache/ 目录, LLMClient.generate() 统一缓存层                                       |
+| NLI 内存缓存            | ✅ 完成   | 2026-05-29 | MD5 全内容哈希 + threading.Lock; 推理在锁外执行, 缓存命中 <0.1ms                                        |
+| 多线程并行化             | ✅ 完成   | 2026-05-29 | src/experiment_runner.py, ThreadPoolExecutor max_workers=4; (question,method) 对为并行单元               |
 
 ---
 
@@ -877,6 +882,11 @@ def run(args):
 - [2026-05-28] min_iterations=2 加入 CBETConfig → 原因：iteration=1 时 CS 高分反映初始检索置信度而非收敛；至少 1 次迭代后才有多轮比较基础 → 注意：此修改将 early stopping 语义从"完全自适应"改为"约束自适应（至少 N 轮后）"；论文中需如实说明 → 效果：待 validation 结果确认（不预设结论）
 - [2026-05-28] HotpotQA 分析策略修正 → HotpotQA difficulty level（easy/medium/hard）≠ hop count → 代码和论文中统一使用"question complexity / difficulty"而非"hop count"来描述 HotpotQA 的分层 → MuSiQue 的 hop count 来自真实标注，可以直接使用
 - [2026-05-28] Failure Mode 分析加入评估框架 → Type A（高CS低EM）和 Type B（低CS高EM）是理解方法边界的重要窗口 → 不预设原因，数据驱动分析
+- [2026-05-29] NLI 迁移本地 GPU（device=auto）→ vLLM 迁移 AutoDL 云端后本地 GPU 完全空闲；DeBERTa ~400MB，与 ES Docker 无资源竞争；NLI 推理从 CPU ~200ms 提升到 GPU ~12ms（约 10-20x）
+- [2026-05-29] NLI score_batch 批量推理 → 将 N 次 forward pass 合并为 1 次（batch_size=32），GPU 利用率大幅提升；compute_coverage 和 compute_completeness_score 统一使用 score_batch
+- [2026-05-29] LLM 磁盘缓存（MD5 全内容哈希）→ 同配置重复实验复用 DAG/claims/probe 结果；预计节省 40-60% LLM 调用；.llm_cache/ 目录，已加入 .gitignore；base LLMClient.generate() 统一处理缓存
+- [2026-05-29] NLI 内存缓存（MD5 全内容哈希 + threading.Lock）→ MD5(完整内容) 杜绝截断 key 的碰撞风险（致命 bug 预防）；Lock 保护 dict 写操作，推理在锁外执行允许并发 GPU 利用
+- [2026-05-29] 样本级多线程并行化（ThreadPoolExecutor, max_workers=4）→ vLLM 云端调用为网络 I/O 密集型；LLM 等待期间本地 GPU 并发处理 NLI；NLIScorer 跨线程共享（缓存加锁），run_exp1_main.py 使用 (question, method) 对作为并行单元
 
 ---
 

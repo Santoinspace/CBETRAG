@@ -1,8 +1,19 @@
-"""LLMClient abstraction layer — supports AWQ, HuggingFace, and vLLM backends."""
+"""LLMClient abstraction layer — supports AWQ, HuggingFace, and vLLM backends.
+
+Includes MD5-based disk cache for deterministic LLM calls (DAG extraction,
+claim extraction, parametric probe). Final answer generation should pass
+use_cache=False since context changes across iterations.
+"""
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
+import hashlib
+import json
+import logging
 import math
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -12,15 +23,78 @@ class LLMResponse:
 
 
 class LLMClient(ABC):
+    """Base LLM client with optional disk cache."""
+
+    def __init__(self, cache_dir: str = "./.llm_cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    def _cache_key(self, prompt: str, max_new_tokens: int,
+                   temperature: float) -> str:
+        """MD5 of full content — no truncation, eliminates collision risk."""
+        content = f"{prompt}|||{max_new_tokens}|||{temperature}"
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+    def generate(self, prompt: str, max_new_tokens: int = 512,
+                 temperature: float = 0.0, use_cache: bool = True) -> LLMResponse:
+        """Generate with disk cache. Pass use_cache=False for non-deterministic calls."""
+        if not use_cache:
+            return self._generate(prompt, max_new_tokens, temperature)
+
+        key = self._cache_key(prompt, max_new_tokens, temperature)
+        cache_file = self.cache_dir / f"{key}.json"
+
+        if cache_file.exists():
+            self._cache_hits += 1
+            try:
+                data = json.loads(cache_file.read_text(encoding='utf-8'))
+                return LLMResponse(
+                    text=data["text"],
+                    logprobs=data.get("logprobs", [])
+                )
+            except Exception:
+                # Corrupted cache entry — fall through to actual call
+                pass
+
+        self._cache_misses += 1
+        response = self._generate(prompt, max_new_tokens, temperature)
+
+        try:
+            cache_file.write_text(
+                json.dumps({
+                    "text": response.text,
+                    "logprobs": response.logprobs,
+                    "prompt_preview": prompt[:200],
+                }, ensure_ascii=False),
+                encoding='utf-8',
+            )
+        except Exception as e:
+            logger.debug("cache write failed: %s", e)
+
+        return response
+
     @abstractmethod
-    def generate(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.0) -> LLMResponse:
+    def _generate(self, prompt: str, max_new_tokens: int = 512,
+                  temperature: float = 0.0) -> LLMResponse:
+        """Subclass implementation — called when cache misses."""
         ...
+
+    def cache_stats(self) -> str:
+        total = self._cache_hits + self._cache_misses
+        if total == 0:
+            return "No LLM calls yet"
+        rate = self._cache_hits / total * 100
+        return (f"LLM cache: {self._cache_hits}/{total} "
+                f"hits ({rate:.0f}%)")
 
 
 class AWQClient(LLMClient):
     """Qwen2.5-7B-Instruct-AWQ via autoawq — primary backend for RTX 4060 8GB."""
 
-    def __init__(self, model_path: str, seed: int = 42):
+    def __init__(self, model_path: str, seed: int = 42, **kwargs):
+        super().__init__(**kwargs)
         import torch
         from awq import AutoAWQForCausalLM
         from transformers import AutoTokenizer
@@ -30,7 +104,8 @@ class AWQClient(LLMClient):
             model_path, fuse_layers=True, trust_remote_code=False, safetensors=True
         )
 
-    def generate(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.0) -> LLMResponse:
+    def _generate(self, prompt: str, max_new_tokens: int = 512,
+                  temperature: float = 0.0) -> LLMResponse:
         import torch
         inputs = self.tokenizer(prompt, return_tensors="pt").to("cuda")
         prompt_len = inputs["input_ids"].shape[1]
@@ -57,7 +132,9 @@ class AWQClient(LLMClient):
 class HFClient(LLMClient):
     """Standard HuggingFace backend (bfloat16) — for environments with more VRAM."""
 
-    def __init__(self, model_path: str, device: str = "cuda", seed: int = 42):
+    def __init__(self, model_path: str, device: str = "cuda", seed: int = 42,
+                 **kwargs):
+        super().__init__(**kwargs)
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM
         torch.manual_seed(seed)
@@ -66,7 +143,8 @@ class HFClient(LLMClient):
             model_path, torch_dtype=torch.bfloat16, device_map=device
         ).eval()
 
-    def generate(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.0) -> LLMResponse:
+    def _generate(self, prompt: str, max_new_tokens: int = 512,
+                  temperature: float = 0.0) -> LLMResponse:
         import torch
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         prompt_len = inputs["input_ids"].shape[1]
@@ -92,12 +170,13 @@ class VLLMClient(LLMClient):
     """OpenAI-compatible vLLM backend — connects to a running vLLM server.
 
     Usage:
-        client = VLLMClient(base_url="http://localhost:8000/v1", model="/models/qwen")
+        client = VLLMClient(base_url="http://localhost:8000/v1", model="qwen25-7b")
     """
 
     def __init__(self, base_url: str = "http://localhost:8000/v1",
                  model: str = "/models/qwen", api_key: str = "EMPTY",
-                 seed: int = 42):
+                 seed: int = 42, **kwargs):
+        super().__init__(**kwargs)
         try:
             from openai import OpenAI
         except ImportError:
@@ -106,8 +185,8 @@ class VLLMClient(LLMClient):
         self._model = model
         self._seed = seed
 
-    def generate(self, prompt: str, max_new_tokens: int = 512,
-                 temperature: float = 0.0) -> LLMResponse:
+    def _generate(self, prompt: str, max_new_tokens: int = 512,
+                  temperature: float = 0.0) -> LLMResponse:
         try:
             resp = self._client.chat.completions.create(
                 model=self._model,

@@ -34,7 +34,10 @@ def _make_llm(dag_json: str, answers: list[str]) -> LLMClient:
     responses = [dag_json] + answers
 
     class _LLM(LLMClient):
-        def generate(self, prompt, **kw):
+        def __init__(self):
+            import tempfile
+            super().__init__(cache_dir=tempfile.mkdtemp(prefix="test_llm_cache_"))
+        def _generate(self, prompt, max_new_tokens=512, temperature=0.0, **kw):
             idx = min(call_count[0], len(responses) - 1)
             call_count[0] += 1
             return LLMResponse(text=responses[idx], logprobs=[-0.1, -0.1])
@@ -95,9 +98,10 @@ def test_solve_returns_cbet_result():
 
 def test_solve_stops_when_cs_sufficient():
     llm = _make_llm(_DAG_JSON, ["James Cameron"] * 10)
-    ctrl = CBETController(llm, _RETRIEVER, _make_nli_scorer(should_stop=True), _make_probe())
+    ctrl = CBETController(llm, _RETRIEVER, _make_nli_scorer(should_stop=True), _make_probe(),
+                          CBETConfig(min_iterations=1))
     result = ctrl.solve(_question())
-    assert result.iterations == 1  # stops after first iteration
+    assert result.iterations == 1  # stops after first iteration (min_iterations=1)
 
 
 def test_solve_runs_max_iterations_when_never_stops():

@@ -30,11 +30,10 @@ class DatasetPassageRetriever:
         return self._corpus[:top_k]
 
 
-def run_cbet(q: Question, llm: VLLMClient, min_iter: int, theta: float = 0.50) -> dict:
+def run_cbet(q: Question, llm: VLLMClient, nli: NLIScorer,
+             min_iter: int, theta: float = 0.50) -> dict:
     corpus = q.gold_passages + q.distractor_passages
     retriever = DatasetPassageRetriever(corpus)
-    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="cpu",
-                     theta=theta, gcs_conflict_threshold=0.35)
     probe = ParametricProbe(llm)
     config = CBETConfig(
         theta=theta, tau=0.5, max_iterations=3, max_branches=6,
@@ -78,7 +77,8 @@ def main():
     parser.add_argument("--vllm_url", default="http://localhost:8000/v1")
     parser.add_argument("--vllm_model", default="qwen25-7b")
     parser.add_argument("--theta", type=float, default=0.50)
-    parser.add_argument("--output", type=str, default="experiments/results/min_iterations_validation.json")
+    parser.add_argument("--output", type=str,
+                        default="experiments/results/min_iterations_validation.json")
     args = parser.parse_args()
 
     print(f"Validating min_iterations: {args.n_samples} HotpotQA samples")
@@ -86,24 +86,32 @@ def main():
     print("=" * 80)
 
     llm = VLLMClient(base_url=args.vllm_url, model=args.vllm_model)
+
+    # Shared NLIScorer: GPU + cache reused across all samples
+    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="auto",
+                     theta=args.theta, gcs_conflict_threshold=0.35)
+
     questions = load_dataset("hotpotqa", n_samples=args.n_samples)
 
     results_m1 = []
     results_m2 = []
+    t_start = time.time()
 
     for i, q in enumerate(questions):
         # Run with min_iterations=1
-        r1 = run_cbet(q, llm, min_iter=1, theta=args.theta)
+        r1 = run_cbet(q, llm, nli, min_iter=1, theta=args.theta)
         results_m1.append(r1)
 
         # Run with min_iterations=2
-        r2 = run_cbet(q, llm, min_iter=2, theta=args.theta)
+        r2 = run_cbet(q, llm, nli, min_iter=2, theta=args.theta)
         results_m2.append(r2)
 
         print(f"[{i+1}/{args.n_samples}] min_iter=1: EM={r1['em']} F1={r1['f1']:.3f} "
               f"CS={r1['final_cs']:.3f} early_stop={r1['early_stopped']} | "
               f"min_iter=2: EM={r2['em']} F1={r2['f1']:.3f} "
               f"CS={r2['final_cs']:.3f} early_stop={r2['early_stopped']}")
+
+    elapsed = time.time() - t_start
 
     # Aggregate metrics
     def aggregate(results: list[dict]) -> dict:
@@ -130,20 +138,30 @@ def main():
     m1_agg = aggregate(results_m1)
     m2_agg = aggregate(results_m2)
 
+    print(f"\nElapsed: {elapsed:.0f}s ({elapsed/args.n_samples:.1f}s/sample)")
+    print(f"LLM: {llm.cache_stats()}")
+    print(f"NLI: {nli.cache_stats()}")
     print("\n" + "=" * 80)
     print("=== Validation Results ===")
-    print(f"{'Metric':<25} {'min_iter=1':>15} {'min_iter=2':>15}")
-    print("-" * 60)
-    print(f"{'CBET EM':<25} {m1_agg['em']:>15.1f} {m2_agg['em']:>15.1f}")
-    print(f"{'CBET F1':<25} {m1_agg['f1']:>15.1f} {m2_agg['f1']:>15.1f}")
-    print(f"{'EarlyStop%':<25} {m1_agg['early_stop_pct']:>14.1f}% {m2_agg['early_stop_pct']:>14.1f}%")
-    print(f"{'Avg-Ret':<25} {m1_agg['avg_iterations']:>15.2f} {m2_agg['avg_iterations']:>15.2f}")
-    print(f"{'Avg-LM':<25} {m1_agg['avg_lm']:>15.1f} {m2_agg['avg_lm']:>15.1f}")
-    print(f"{'EM=0 & CS>=0.5 (wrong early stop)':<25} {m1_agg['early_stop_wrong']:>12}/50 {m2_agg['early_stop_wrong']:>12}/50")
+    print(f"{'Metric':<35} {'min_iter=1':>15} {'min_iter=2':>15}")
+    print("-" * 70)
+    print(f"{'CBET EM':<35} {m1_agg['em']:>15.1f} {m2_agg['em']:>15.1f}")
+    print(f"{'CBET F1':<35} {m1_agg['f1']:>15.1f} {m2_agg['f1']:>15.1f}")
+    print(f"{'EarlyStop%':<35} {m1_agg['early_stop_pct']:>14.1f}% {m2_agg['early_stop_pct']:>14.1f}%")
+    print(f"{'Avg-Ret (iterations)':<35} {m1_agg['avg_iterations']:>15.2f} {m2_agg['avg_iterations']:>15.2f}")
+    print(f"{'Avg-LM':<35} {m1_agg['avg_lm']:>15.1f} {m2_agg['avg_lm']:>15.1f}")
+    print(f"{'EM=0 & CS>=0.5 (wrong early stop)':<35} {m1_agg['early_stop_wrong']:>12}/{args.n_samples} {m2_agg['early_stop_wrong']:>12}/{args.n_samples}")
     print("=" * 80)
 
-    # Save results
+    # Save results (overwrite existing)
     output = {
+        "config": {
+            "n_samples": args.n_samples,
+            "vllm_url": args.vllm_url,
+            "vllm_model": args.vllm_model,
+            "theta": args.theta,
+            "elapsed_seconds": elapsed,
+        },
         "min_iterations_1": {"results": results_m1, "aggregate": m1_agg},
         "min_iterations_2": {"results": results_m2, "aggregate": m2_agg},
     }

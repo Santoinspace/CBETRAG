@@ -4,7 +4,7 @@ Fast tests use a mock NLI model (no GPU needed).
 Integration tests (marked 'gpu') require the real DeBERTa model.
 Run fast tests only: pytest tests/test_nli_scorer.py -m "not gpu"
 """
-import sys, json
+import sys, json, threading
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -20,8 +20,10 @@ from src.llm_client import LLMClient, LLMResponse
 class MockLLM(LLMClient):
     """Returns a fixed claims JSON."""
     def __init__(self, claims: list[str]):
+        import tempfile
+        super().__init__(cache_dir=tempfile.mkdtemp(prefix="test_llm_cache_"))
         self._resp = json.dumps({"claims": claims})
-    def generate(self, prompt, **kw):
+    def _generate(self, prompt, max_new_tokens=512, temperature=0.0, **kw):
         return LLMResponse(text=self._resp)
 
 
@@ -33,6 +35,12 @@ def _make_scorer(label_probs: dict[str, list[float]]) -> NLIScorer:
     scorer.theta = 0.75
     scorer.gcs_conflict_threshold = 0.35
     scorer.lm_call_count = {}
+    # Cache attributes
+    scorer._nli_cache = {}
+    scorer._cache_lock = threading.Lock()
+    scorer._tokenizer_lock = threading.Lock()
+    scorer._cache_hits = 0
+    scorer._cache_misses = 0
 
     # Mock tokenizer
     tok = MagicMock()
@@ -63,18 +71,24 @@ def _make_scorer(label_probs: dict[str, list[float]]) -> NLIScorer:
 
 
 def _scorer_with_logits(logits_fn) -> NLIScorer:
-    """NLIScorer whose _batch_score is fully replaced."""
+    """NLIScorer whose score_batch is fully replaced."""
     scorer = NLIScorer.__new__(NLIScorer)
     scorer.device = "cpu"
     scorer.batch_size = 16
     scorer.theta = 0.75
     scorer.gcs_conflict_threshold = 0.35
     scorer.lm_call_count = {}
+    # Cache attributes
+    scorer._nli_cache = {}
+    scorer._cache_lock = threading.Lock()
+    scorer._tokenizer_lock = threading.Lock()
+    scorer._cache_hits = 0
+    scorer._cache_misses = 0
     tok = MagicMock()
     tok.encode.return_value = list(range(10))
     tok.decode.return_value = "text"
     scorer.tokenizer = tok
-    scorer._batch_score = logits_fn
+    scorer.score_batch = logits_fn
     return scorer
 
 
@@ -251,11 +265,17 @@ def test_score_pair_fallback_on_error():
     tok.encode.return_value = list(range(5))
     tok.decode.return_value = "x"
     scorer.tokenizer = tok
+    # Cache attributes
+    scorer._nli_cache = {}
+    scorer._cache_lock = threading.Lock()
+    scorer._tokenizer_lock = threading.Lock()
+    scorer._cache_hits = 0
+    scorer._cache_misses = 0
 
     def raise_error(pairs):
         raise RuntimeError("GPU OOM")
 
-    scorer._batch_score = raise_error
+    scorer.score_batch = raise_error
     result = scorer.score_pair("premise", "hypothesis")
     assert result.label == "neutral"
 
@@ -271,14 +291,16 @@ _model_available = Path(MODEL_PATH).exists()
 class TestNLIScorerIntegration:
     @pytest.fixture(scope="class")
     def scorer(self):
-        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-        return NLIScorer(model_path=MODEL_PATH, device=device)
+        return NLIScorer(model_path=MODEL_PATH, device="auto")
 
     @pytest.fixture(scope="class")
     def llm(self):
         # Minimal mock that returns the input text as a single claim
         class PassthroughLLM(LLMClient):
-            def generate(self, prompt, **kw):
+            def __init__(self):
+                import tempfile
+                super().__init__(cache_dir=tempfile.mkdtemp(prefix="test_llm_cache_"))
+            def _generate(self, prompt, max_new_tokens=512, temperature=0.0, **kw):
                 # Extract text after "Text:" line
                 for line in prompt.splitlines():
                     if line.startswith("Text:"):
