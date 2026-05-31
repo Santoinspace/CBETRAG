@@ -905,6 +905,9 @@ def run(args):
 - [2026-05-29] vLLM 模型一致性检查 → run_exp1_main.py 新增 `check_model_consistency()` → 启动前通过 OpenAI models.list() API 验证 vLLM server 上的模型 ID 与 --vllm_model 参数匹配；不匹配时 sys.exit(1) 防止错误配置运行实验
 - [2026-05-29] LLM 空响应重试 + 不缓存空结果 → `_generate_with_retry()` 实现 3 次重试 + 指数退避（1s/2s/4s）；空响应不写入缓存；已有空缓存条目在 generate() 中被跳过并回退到实际调用；根因：vLLM 并发超时返回 "" 被缓存后污染后续重跑
 - [2026-05-29] 受损样本判定标准 → 空答案（answer.strip()==""）→ 而非低 CS 分数；低 CS（<0.01）是 Edge Support 的正常行为（DAG 边支撑弱 ≠ 故障）；check_exp1_quality.py 仅标记空答案 qid 为受损，全量 1000 CBET 中仅 2 个空答案 + 3 个 qid 跨方法受损
+- [2026-05-29] 消融实验变体重新定义 → 5 variants: full/no_cross_branch/no_override(theta=1.1→永不早停)/no_early_stop(single_branch→max_branches=1)；替代旧 entropy_only/fixed_rounds；更直接对应论文 Section 5.4 的消融问题
+- [2026-05-29] skip_epistemic_override 加入 CBETConfig → 替代 tau=2.0 hack；solve() 中 `if not config.skip_epistemic_override and conflict.trust_retrieved > tau`；语义更清晰
+- [2026-05-29] Exp2/Exp3 共享 NLIScorer + --workers → 与 Exp1 统一架构；NLIScorer 在 main() 创建一次传入所有 run_variant()；run_experiment_parallel() 支持并行；device="auto"（GPU）
 
 ---
 

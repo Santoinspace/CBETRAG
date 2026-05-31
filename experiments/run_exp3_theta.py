@@ -9,7 +9,8 @@ Supports interrupt/resume: if output JSON exists, processed (theta, qid) pairs a
 Usage:
     uv run python experiments/run_exp3_theta.py \
         --n_samples 100 \
-        --vllm_model qwen25-7b
+        --vllm_model qwen25-7b \
+        --workers 2
 """
 from __future__ import annotations
 import argparse
@@ -25,13 +26,10 @@ from src.data_adapter import load_dataset, Question
 from src.cbet_controller import CBETController, CBETConfig
 from src.parametric_probe import ParametricProbe
 from src.nli_scorer import NLIScorer
+from src.experiment_runner import run_experiment_parallel
 
 
 THETA_VALUES = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-
-def safe_str(s: str, max_len: int = 80) -> str:
-    return "".join(ch if ord(ch) < 128 else "?" for ch in s[:max_len])
 
 
 def em_score(pred: str, gold: str) -> int:
@@ -58,19 +56,20 @@ class DatasetPassageRetriever:
         return self._corpus[:top_k]
 
 
-def run_cbet_theta(q: Question, llm: VLLMClient, theta: float) -> dict:
+def run_cbet_theta(q: Question, llm: VLLMClient, nli: NLIScorer,
+                   theta: float) -> dict:
+    """Run one (question, theta) pair with shared NLIScorer."""
     t0 = time.time()
     retriever = DatasetPassageRetriever(q.gold_passages + q.distractor_passages)
-    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="cpu",
-                     theta=theta, gcs_conflict_threshold=0.35)
     probe = ParametricProbe(llm)
     config = CBETConfig(theta=theta, tau=0.5, max_iterations=3, min_iterations=1,
                         max_branches=6, gcs_conflict_threshold=0.35)
     controller = CBETController(llm, retriever, nli, probe, config)
     result = controller.solve(q)
-    early_stopped = result.iterations < config.max_iterations and result.cs_score >= theta
+    early_stopped = (result.iterations < config.max_iterations
+                     and result.cs_score >= theta)
     return {
-        "theta": theta, "qid": q.qid,
+        "theta": theta, "qid": q.qid, "dataset": q.dataset,
         "answer": result.answer, "gold_answer": q.answer,
         "retrieval_rounds": result.iterations,
         "lm_calls": result.log.get("total_lm_calls", 0),
@@ -133,16 +132,35 @@ def main():
     parser.add_argument("--thetas", nargs="+", type=float, default=THETA_VALUES)
     parser.add_argument("--vllm_url", default="http://localhost:8000/v1")
     parser.add_argument("--vllm_model", default="qwen25-7b")
+    parser.add_argument("--workers", type=int, default=2,
+                        help="Parallel workers (2 conservative)")
     parser.add_argument("--output", default="experiments/results/exp3_theta.json")
     args = parser.parse_args()
 
     print("=" * 80)
     print(f"Exp3 — Theta Sensitivity: {args.dataset}, n={args.n_samples}")
     print(f"Thetas: {args.thetas}")
-    print(f"vLLM: {args.vllm_url} / {args.vllm_model}")
+    print(f"vLLM: {args.vllm_url} / {args.vllm_model}, workers={args.workers}")
     print("=" * 80)
 
+    # Shared resources
     llm = VLLMClient(base_url=args.vllm_url, model=args.vllm_model)
+
+    # Model consistency check
+    try:
+        models = llm._client.models.list()
+        server_models = [m.id for m in models.data]
+        if args.vllm_model not in server_models:
+            print(f"[ERROR] Expected '{args.vllm_model}' not on server: {server_models}")
+            sys.exit(1)
+        print(f"  [OK] vLLM model: '{args.vllm_model}'")
+    except Exception as e:
+        print(f"  [WARN] Could not verify model: {e}")
+
+    # Shared NLIScorer (GPU, cache shared across all theta runs)
+    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="auto",
+                     theta=0.5, gcs_conflict_threshold=0.35)
+
     questions = load_dataset(args.dataset, n_samples=args.n_samples)
     print(f"Loaded {len(questions)} questions")
 
@@ -150,22 +168,38 @@ def main():
 
     for theta in args.thetas:
         print(f"\n=== theta={theta} ===")
-        for i, q in enumerate(questions):
-            if (theta, q.qid) in done:
-                continue
-            r = run_cbet_theta(q, llm, theta)
-            all_results.append(r)
-            done.add((theta, q.qid))
-            if (i + 1) % 10 == 0 or i == 0:
-                print(f"  [{i+1}/{len(questions)}] EM={em_score(r['answer'], q.answer)} "
-                      f"CS={r.get('final_cs',0):.3f} early={r.get('early_stopped')}")
-            if (i + 1) % 20 == 0:
-                with open(args.output, "w", encoding="utf-8") as f:
-                    json.dump(all_results, f, indent=2, ensure_ascii=False)
 
+        # Build task list for this theta
+        tasks = [(q, theta) for q in questions if (theta, q.qid) not in done]
+        print(f"  Pending: {len(tasks)}/{len(questions)}")
+
+        if not tasks:
+            continue
+
+        def process_task(task):
+            q, t = task
+            return run_cbet_theta(q, llm, nli, t)
+
+        batch_results = run_experiment_parallel(
+            questions=tasks,
+            method_fn=process_task,
+            max_workers=args.workers,
+            checkpoint_every=20,
+            checkpoint_fn=None,
+            desc=f"theta={theta}",
+        )
+
+        all_results.extend(batch_results)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        print(f"  Saved: {len(all_results)} total results")
+
+    # Final save
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     print(f"\nSaved {len(all_results)} results to {args.output}")
+    print(f"LLM: {llm.cache_stats()}")
+    print(f"NLI: {nli.cache_stats()}")
 
     rows = [summarize(all_results, t) for t in args.thetas]
     rows = [r for r in rows if r]

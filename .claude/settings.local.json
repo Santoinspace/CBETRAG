@@ -30,7 +30,8 @@
       "Bash(curl -s -X GET \"http://localhost:9200/wiki/_search?pretty\" -H 'Content-Type: application/json' -d '{\"query\":{\"match\":{\"txt\":\"Inception film director\"}},\"size\":2,\"_source\":[\"txt\",\"title\"]}')",
       "Bash(curl -s --connect-timeout 5 http://localhost:8000/v1/models)",
       "Bash(curl -s --connect-timeout 3 http://localhost:8000/v1/models)",
-      "Bash(echo \"EXIT=$?\")"
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(tasklist)"
     ]
   },
   "skillOverrides": {

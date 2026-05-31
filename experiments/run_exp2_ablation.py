@@ -2,10 +2,10 @@
 
 Variants (matches paper Section 5.4):
   full            — complete CBET
-  no_cross_branch — disable cross-branch GCS (always 1.0)
-  no_override     — disable epistemic override
-  entropy_only    — disable NLI claim extraction (token-entropy only)
-  fixed_rounds    — disable CS stopping (always max iterations)
+  no_cross_branch — skip cross-branch GCS (GCS always 1.0)
+  no_override     — skip epistemic override
+  no_early_stop   — theta=1.1 (never triggers early stop)
+  single_branch   — max_branches=1 (degrades to single-branch retrieval)
 
 Expected runtime: 2-3h on RTX 4060 + vLLM 7B.
 Supports interrupt/resume: if output JSON exists, processed (variant, qid) pairs are skipped.
@@ -13,7 +13,8 @@ Supports interrupt/resume: if output JSON exists, processed (variant, qid) pairs
 Usage:
     uv run python experiments/run_exp2_ablation.py \
         --n_samples 200 \
-        --vllm_model qwen25-7b
+        --vllm_model qwen25-7b \
+        --workers 2
 """
 from __future__ import annotations
 import argparse
@@ -29,13 +30,10 @@ from src.data_adapter import load_dataset, Question
 from src.cbet_controller import CBETController, CBETConfig
 from src.parametric_probe import ParametricProbe
 from src.nli_scorer import NLIScorer
+from src.experiment_runner import run_experiment_parallel
 
 
-ABLATION_VARIANTS = ["full", "no_cross_branch", "no_override", "entropy_only", "fixed_rounds"]
-
-
-def safe_str(s: str, max_len: int = 80) -> str:
-    return "".join(ch if ord(ch) < 128 else "?" for ch in s[:max_len])
+ABLATION_VARIANTS = ["full", "no_cross_branch", "no_override", "no_early_stop", "single_branch"]
 
 
 def em_score(pred: str, gold: str) -> int:
@@ -68,25 +66,26 @@ def build_config(variant: str, theta: float) -> CBETConfig:
     if variant == "no_cross_branch":
         config.skip_cross_branch_nli = True
     elif variant == "no_override":
-        config.tau = 2.0  # never triggers
-    elif variant == "entropy_only":
-        config.nli_claim_extraction = False
-    elif variant == "fixed_rounds":
-        config.theta = 2.0  # never stops early
+        config.skip_epistemic_override = True
+    elif variant == "no_early_stop":
+        config.theta = 1.1  # CS can never reach 1.1 → never stops early
+    elif variant == "single_branch":
+        config.max_branches = 1  # DAG truncated to 1 node → single-branch
     return config
 
 
-def run_variant(q: Question, llm: VLLMClient, variant: str, theta: float) -> dict:
+def run_variant(q: Question, llm: VLLMClient, nli: NLIScorer,
+                variant: str, theta: float) -> dict:
+    """Run one (question, variant) pair with shared NLIScorer."""
     t0 = time.time()
     retriever = DatasetPassageRetriever(q.gold_passages + q.distractor_passages)
-    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="auto",
-                     theta=theta, gcs_conflict_threshold=0.35)
     probe = ParametricProbe(llm)
     config = build_config(variant, theta)
     controller = CBETController(llm, retriever, nli, probe, config)
     result = controller.solve(q)
     return {
         "variant": variant, "method": f"CBET-{variant}", "qid": q.qid,
+        "dataset": q.dataset,
         "answer": result.answer, "gold_answer": q.answer,
         "retrieval_rounds": result.iterations,
         "lm_calls": result.log.get("total_lm_calls", 0),
@@ -162,6 +161,8 @@ def main():
     parser.add_argument("--vllm_url", default="http://localhost:8000/v1")
     parser.add_argument("--vllm_model", default="qwen25-7b")
     parser.add_argument("--theta", type=float, default=0.50)
+    parser.add_argument("--workers", type=int, default=2,
+                        help="Parallel workers (2 conservative, 4 recommended)")
     parser.add_argument("--output", default="experiments/results/exp2_ablation.json")
     args = parser.parse_args()
 
@@ -169,10 +170,26 @@ def main():
     print("=" * 80)
     print(f"Exp2 — Ablation Study: {args.dataset}, n={args.n_samples}")
     print(f"Variants: {variants}")
-    print(f"vLLM: {args.vllm_url} / {args.vllm_model}, theta={args.theta}")
+    print(f"vLLM: {args.vllm_url} / {args.vllm_model}, theta={args.theta}, workers={args.workers}")
     print("=" * 80)
 
+    # Shared resources
     llm = VLLMClient(base_url=args.vllm_url, model=args.vllm_model)
+
+    # Model consistency check
+    try:
+        models = llm._client.models.list()
+        server_models = [m.id for m in models.data]
+        if args.vllm_model not in server_models:
+            print(f"[ERROR] Expected '{args.vllm_model}' not on server: {server_models}")
+            sys.exit(1)
+        print(f"  [OK] vLLM model: '{args.vllm_model}'")
+    except Exception as e:
+        print(f"  [WARN] Could not verify model: {e}")
+
+    nli = NLIScorer(model_path="./models/nli-deberta-v3-base", device="auto",
+                     theta=args.theta, gcs_conflict_threshold=0.35)
+
     questions = load_dataset(args.dataset, n_samples=args.n_samples)
     print(f"Loaded {len(questions)} questions")
 
@@ -180,23 +197,38 @@ def main():
 
     for variant in variants:
         print(f"\n=== Variant: {variant} ===")
-        for i, q in enumerate(questions):
-            if (variant, q.qid) in done:
-                continue
-            r = run_variant(q, llm, variant, args.theta)
-            all_results.append(r)
-            done.add((variant, q.qid))
-            if (i + 1) % 10 == 0 or i == 0:
-                print(f"  [{i+1}/{len(questions)}] EM={em_score(r['answer'], q.answer)} "
-                      f"CS={r.get('final_cs',0):.3f} DAG={r.get('dag_size')}")
-            # Periodic save
-            if (i + 1) % 20 == 0:
-                with open(args.output, "w", encoding="utf-8") as f:
-                    json.dump(all_results, f, indent=2, ensure_ascii=False)
 
+        # Build task list for this variant
+        tasks = [(q, variant) for q in questions if (variant, q.qid) not in done]
+        print(f"  Pending: {len(tasks)}/{len(questions)}")
+
+        if not tasks:
+            continue
+
+        def process_task(task):
+            q, v = task
+            return run_variant(q, llm, nli, v, args.theta)
+
+        batch_results = run_experiment_parallel(
+            questions=tasks,
+            method_fn=process_task,
+            max_workers=args.workers,
+            checkpoint_every=20,
+            checkpoint_fn=None,
+            desc=f"{variant}",
+        )
+
+        all_results.extend(batch_results)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        print(f"  Saved: {len(all_results)} total results")
+
+    # Final save
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     print(f"\nSaved {len(all_results)} results to {args.output}")
+    print(f"LLM: {llm.cache_stats()}")
+    print(f"NLI: {nli.cache_stats()}")
 
     rows = [summarize(all_results, v) for v in variants]
     rows = [r for r in rows if r]

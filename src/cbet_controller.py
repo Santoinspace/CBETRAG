@@ -23,7 +23,8 @@ class CBETConfig:
     min_iterations: int = 2  # require at least N iterations before early stopping
     max_branches: int = 6
     nli_claim_extraction: bool = True
-    skip_cross_branch_nli: bool = False  # ablation: no_cross_branch
+    skip_cross_branch_nli: bool = False   # ablation: no_cross_branch
+    skip_epistemic_override: bool = False  # ablation: no_override
     gcs_conflict_threshold: float = 0.35  # density-based: branch pair contradictory if conflict_ratio > this
 
 
@@ -236,7 +237,7 @@ class CBETController:
                             conflicts_detected.append(sq.id)
 
                         # Step 5: epistemic override
-                        if conflict.trust_retrieved > self.config.tau:
+                        if not self.config.skip_epistemic_override and conflict.trust_retrieved > self.config.tau:
                             state.override_prompt = self.epistemic_overrider.build(
                                 sq.text, state.evidence
                             )
